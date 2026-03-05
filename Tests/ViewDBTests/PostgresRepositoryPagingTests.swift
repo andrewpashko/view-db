@@ -55,4 +55,73 @@ final class PostgresRepositoryPagingTests: XCTestCase {
         XCTAssertEqual(selection.strategy, .offset)
         XCTAssertNil(selection.orderColumn)
     }
+
+    func testMakePreviewCellValueTruncatesLongPayloads() {
+        let value = String(repeating: "a", count: 300)
+        let preview = PostgresRepository.makePreviewCellValue(value: value, maxChars: 256)
+
+        XCTAssertTrue(preview.isTruncated)
+        XCTAssertEqual(preview.previewText.count, 257)
+        XCTAssertTrue(preview.previewText.hasSuffix("…"))
+    }
+
+    func testMakePreviewCellValueLeavesShortPayloadUntouched() {
+        let preview = PostgresRepository.makePreviewCellValue(value: "hello", maxChars: 256)
+
+        XCTAssertFalse(preview.isTruncated)
+        XCTAssertEqual(preview.previewText, "hello")
+    }
+
+    func testMakePreviewCellValueLeavesNullMarkerUntouched() {
+        let preview = PostgresRepository.makePreviewCellValue(value: "NULL", maxChars: 256)
+
+        XCTAssertFalse(preview.isTruncated)
+        XCTAssertEqual(preview.previewText, "NULL")
+    }
+
+    func testMakePreviewCellValueTruncatesLargeJSONPayload() {
+        let value = """
+        {"payload":"\(String(repeating: "x", count: 600))"}
+        """
+        let preview = PostgresRepository.makePreviewCellValue(value: value, maxChars: 128)
+
+        XCTAssertTrue(preview.isTruncated)
+        XCTAssertEqual(preview.previewText.count, 129)
+        XCTAssertTrue(preview.previewText.hasSuffix("…"))
+    }
+
+    func testMakePreviewCellValueTruncatesHexPayload() {
+        let value = "0x" + String(repeating: "ab", count: 300)
+        let preview = PostgresRepository.makePreviewCellValue(value: value, maxChars: 128)
+
+        XCTAssertTrue(preview.isTruncated)
+        XCTAssertEqual(preview.previewText.count, 129)
+        XCTAssertTrue(preview.previewText.hasSuffix("…"))
+    }
+
+    func testMakeLookupPlanForNumericIdentity() {
+        let plan = PostgresRepository.makeLookupPlan(
+            for: .columnValue(column: "id", value: "42", valueType: .numeric)
+        )
+
+        XCTAssertEqual(plan, .columnValue(column: "id", literal: "42"))
+    }
+
+    func testMakeLookupPlanForTextIdentity() {
+        let plan = PostgresRepository.makeLookupPlan(
+            for: .columnValue(column: "slug", value: "o'hara", valueType: .textual)
+        )
+
+        XCTAssertEqual(plan, .columnValue(column: "slug", literal: "'o''hara'"))
+    }
+
+    func testMakeLookupPlanForCTIDIdentity() {
+        let plan = PostgresRepository.makeLookupPlan(for: .ctid("(1,2)"))
+        XCTAssertEqual(plan, .ctid(literal: "'(1,2)'::tid"))
+    }
+
+    func testMakeLookupPlanForOffsetIdentity() {
+        let plan = PostgresRepository.makeLookupPlan(for: .offset(9))
+        XCTAssertEqual(plan, .offset(9))
+    }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Logging
 
 struct TableSection: Identifiable, Hashable {
     let schema: String
@@ -24,11 +25,7 @@ final class DatabaseViewModel {
     private(set) var tableSections: [TableSection] = []
     private(set) var selectedTable: TableRef?
 
-    private(set) var rowPage: RowPage = .empty {
-        didSet {
-            tableRows = Self.makeRows(from: rowPage)
-        }
-    }
+    private(set) var rowPage: RowPage = .empty
     private(set) var sqlRowPage: RowPage = .empty {
         didSet {
             sqlRows = Self.makeRows(from: sqlRowPage)
@@ -40,6 +37,7 @@ final class DatabaseViewModel {
 
     private(set) var isLoadingTables = false
     private(set) var isLoadingRows = false
+    private(set) var isLoadingCount = false
     private(set) var isRunningSQL = false
 
     private let maxRowsPerPage = 500
@@ -65,6 +63,8 @@ final class DatabaseViewModel {
     private var tableTask: Task<Void, Never>?
     private var sqlTask: Task<Void, Never>?
     private var countTask: Task<Void, Never>?
+    private let logger = Logger(label: "com.viewdb.ui.database")
+    private let previewLimitChars = 256
 
     init(
         database: DatabaseRef,
@@ -201,6 +201,22 @@ final class DatabaseViewModel {
         await runSQLImpl()
     }
 
+    func fetchFullCellValue(rowIdentity: RowIdentity, columnName: String) async -> String? {
+        guard let selectedTable else { return nil }
+
+        do {
+            return try await queryService.fetchCellValue(
+                database: database,
+                table: selectedTable,
+                rowIdentity: rowIdentity,
+                columnName: columnName
+            )
+        } catch {
+            logger.debug("fetchFullCellValue failed: \(String(describing: error))")
+            return nil
+        }
+    }
+
     func submitCredentials(_ credentials: ConnectionCredentials) {
         guard let instance else { return }
 
@@ -270,6 +286,7 @@ final class DatabaseViewModel {
             } else {
                 rowPage = .empty
                 totalRowCount = nil
+                isLoadingCount = false
             }
         } catch {
             handle(error: error, instance: resolvedInstance, forSQL: false)
@@ -282,12 +299,14 @@ final class DatabaseViewModel {
         guard let selectedTable else {
             rowPage = .empty
             totalRowCount = nil
+            isLoadingCount = false
             return
         }
 
         if refreshCount {
             countTask?.cancel()
             totalRowCount = nil
+            isLoadingCount = false
         }
 
         rowTask?.cancel()
@@ -303,12 +322,21 @@ final class DatabaseViewModel {
         defer { isLoadingRows = false }
 
         do {
-            let page = try await queryService.fetchRows(database: database, table: table, request: request)
+            let start = CFAbsoluteTimeGetCurrent()
+            let previewPage = try await queryService.fetchRowsPreview(
+                database: database,
+                table: table,
+                request: request,
+                previewLimitChars: previewLimitChars
+            )
             if Task.isCancelled { return }
-            rowPage = page
-            if rowsPerPage != page.limit {
-                rowsPerPage = min(page.limit, maxRowsPerPage)
+            rowPage = Self.makeRowPageMetadata(from: previewPage)
+            tableRows = previewPage.rows
+            if rowsPerPage != previewPage.limit {
+                rowsPerPage = min(previewPage.limit, maxRowsPerPage)
             }
+            let elapsedMS = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            logger.debug("grid preview updated in \(elapsedMS)ms")
 
             if refreshCount || totalRowCount == nil {
                 fetchRowCount(table: table)
@@ -316,6 +344,7 @@ final class DatabaseViewModel {
         } catch {
             handle(error: error, instance: instance, forSQL: false)
             totalRowCount = nil
+            isLoadingCount = false
         }
     }
 
@@ -371,8 +400,10 @@ final class DatabaseViewModel {
 
     private func fetchRowCount(table: TableRef) {
         countTask?.cancel()
+        isLoadingCount = true
         countTask = Task { [weak self] in
             guard let self else { return }
+            defer { self.isLoadingCount = false }
 
             do {
                 let count = try await self.queryService.fetchRowCount(database: self.database, table: table)
@@ -392,9 +423,30 @@ final class DatabaseViewModel {
         return max(1, rowPage.limit == 0 ? fallback : rowPage.limit)
     }
 
+    private static func makeRowPageMetadata(from preview: RowPagePreview) -> RowPage {
+        RowPage(
+            columns: preview.columns,
+            rows: [],
+            limit: preview.limit,
+            offset: preview.offset,
+            hasNext: preview.hasNext,
+            strategy: preview.strategy,
+            orderedByColumn: preview.orderedByColumn,
+            nextCursor: preview.nextCursor,
+            previousCursor: preview.previousCursor
+        )
+    }
+
     private static func makeRows(from page: RowPage) -> [TableRowItem] {
         page.rows.enumerated().map { offset, row in
-            TableRowItem(id: page.offset + offset, values: row)
+            let cellValues = row.map { value in
+                TableCellValue(previewText: value, isTruncated: false)
+            }
+            return TableRowItem(
+                id: page.offset + offset,
+                identity: .offset(page.offset + offset),
+                values: cellValues
+            )
         }
     }
 }

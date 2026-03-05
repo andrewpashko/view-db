@@ -25,13 +25,15 @@ struct DatabaseView: View {
             detail
         }
         .navigationTitle(database.name)
+        .toolbar(removing: .title)
         .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 toolbarTitleLabel
             }
-            ToolbarItem(placement: .primaryAction) {
-                toolbarControls
+            ToolbarItemGroup(placement: .primaryAction) {
+                runSQLButton
+                refreshButton
             }
         }
         .sheet(isPresented: $viewModel.isSQLSheetPresented) {
@@ -164,7 +166,7 @@ struct DatabaseView: View {
             .accessibilityLabel("Loading tables")
             .accessibilityHidden(!viewModel.isLoadingTables)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .padding(.horizontal, 14)
     }
 
     @ViewBuilder
@@ -201,11 +203,14 @@ struct DatabaseView: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                DataGridView(columns: viewModel.rowPage.columns, rows: viewModel.tableRows)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .transaction { transaction in
-                        transaction.animation = nil
+                TableGridSection(
+                    columns: viewModel.rowPage.columns,
+                    rows: viewModel.tableRows,
+                    onRequestFullValue: { rowIdentity, columnName in
+                        await viewModel.fetchFullCellValue(rowIdentity: rowIdentity, columnName: columnName)
                     }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -248,31 +253,20 @@ struct DatabaseView: View {
         )
     }
 
-    @ViewBuilder
-    private var toolbarControls: some View {
-        if #available(macOS 26.0, *) {
-            GlassEffectContainer(spacing: 8) {
-                toolbarButtons
-            }
-        } else {
-            toolbarButtons
+    private var runSQLButton: some View {
+        Button("Run SQL") {
+            viewModel.openSQLSheet()
         }
+        .controlSize(.large)
     }
 
-    private var toolbarButtons: some View {
-        HStack(spacing: 8) {
-            Button("Run SQL") {
-                viewModel.openSQLSheet()
-            }
-            .viewDBGlassButton()
-
-            Button {
-                viewModel.refresh()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .viewDBGlassButton()
+    private var refreshButton: some View {
+        Button {
+            viewModel.refresh()
+        } label: {
+            Image(systemName: "arrow.clockwise")
         }
+        .controlSize(.large)
     }
 
     private var pagingButtons: some View {
@@ -331,7 +325,7 @@ struct DatabaseView: View {
     }
 
     private var visibleRangeText: String {
-        let count = viewModel.rowPage.rows.count
+        let count = viewModel.tableRows.count
         guard count > 0 else { return "0-0" }
 
         let start = viewModel.rowPage.offset + 1
@@ -343,7 +337,24 @@ struct DatabaseView: View {
         if let total = viewModel.totalRowCount {
             return total.formatted()
         }
-        return viewModel.isLoadingRows ? "…" : "—"
+        return (viewModel.isLoadingRows || viewModel.isLoadingCount) ? "…" : "—"
     }
 
+}
+
+private struct TableGridSection: View {
+    let columns: [String]
+    let rows: [TableRowItem]
+    let onRequestFullValue: DataGridView.FullValueProvider
+
+    var body: some View {
+        DataGridView(
+            columns: columns,
+            rows: rows,
+            onRequestFullValue: onRequestFullValue
+        )
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+    }
 }

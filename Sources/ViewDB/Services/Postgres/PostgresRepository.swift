@@ -13,6 +13,17 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         case numeric
         case textual
         case ctid
+
+        var rowIdentityValueType: RowIdentityValueType? {
+            switch self {
+            case .numeric:
+                return .numeric
+            case .textual:
+                return .textual
+            case .ctid:
+                return nil
+            }
+        }
     }
 
     private struct TableColumnMeta: Sendable {
@@ -45,6 +56,12 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         var columns: [String]
         var rows: [[String]]
         var hiddenCursors: [String]?
+    }
+
+    enum FullValueLookupPlan: Equatable {
+        case offset(Int)
+        case columnValue(column: String, literal: String)
+        case ctid(literal: String)
     }
 
     private let sessionPool: PostgresSessionPool
@@ -218,6 +235,160 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
             )
 
             return output
+        }
+    }
+
+    func fetchRowsPreview(
+        database: DatabaseRef,
+        table: TableRef,
+        request: RowPageRequest,
+        previewLimitChars: Int
+    ) async throws -> RowPagePreview {
+        let instance = try await resolveInstance(for: database)
+        let pageLimit = max(1, request.limit)
+        let logicalOffset = max(0, request.offset)
+        let previewLimit = max(16, previewLimitChars)
+        let pagingPlan = try await resolvePagingPlan(
+            database: database,
+            table: table,
+            instance: instance
+        )
+
+        return try await sessionPool.withConnection(instance: instance, database: database.name) { connection, logger in
+            let start = CFAbsoluteTimeGetCurrent()
+            let queryPlan = Self.makeQueryExecutionPlan(
+                table: table,
+                pagingPlan: pagingPlan,
+                request: request,
+                limit: pageLimit
+            )
+
+            let sequence = try await connection.query(PostgresQuery(unsafeSQL: queryPlan.sql), logger: logger)
+            var collected = try await Self.collectRows(
+                sequence: sequence,
+                cap: pageLimit + 1,
+                hiddenLeadingCursor: queryPlan.hiddenLeadingCursor
+            )
+
+            let hasNext: Bool
+            switch request.direction {
+            case .previous where queryPlan.strategy.usesCursor && request.cursor != nil:
+                let hasPreviousPage = collected.rows.count > pageLimit
+                if hasPreviousPage {
+                    collected.rows.removeLast()
+                    collected.hiddenCursors?.removeLast()
+                }
+                collected.rows.reverse()
+                collected.hiddenCursors?.reverse()
+                hasNext = !collected.rows.isEmpty
+            default:
+                hasNext = collected.rows.count > pageLimit
+                if hasNext {
+                    collected.rows.removeLast()
+                    collected.hiddenCursors?.removeLast()
+                }
+            }
+
+            let cursorPair = Self.resolveCursors(
+                rows: collected.rows,
+                hiddenCursors: collected.hiddenCursors,
+                strategy: queryPlan.strategy,
+                orderColumn: queryPlan.orderColumn,
+                columns: pagingPlan.columns
+            )
+
+            let rows: [TableRowItem] = collected.rows.enumerated().map { rowOffset, row in
+                let identity: RowIdentity = Self.makeRowIdentity(
+                    strategy: queryPlan.strategy,
+                    orderColumn: queryPlan.orderColumn,
+                    orderType: queryPlan.orderType,
+                    row: row,
+                    hiddenCursor: collected.hiddenCursors?[safe: rowOffset],
+                    columns: pagingPlan.columns,
+                    fallbackOffset: logicalOffset + rowOffset
+                )
+                let previewValues = row.map { value in
+                    Self.makePreviewCellValue(value: value, maxChars: previewLimit)
+                }
+                return TableRowItem(id: logicalOffset + rowOffset, identity: identity, values: previewValues)
+            }
+
+            let nextCursor: String?
+            if queryPlan.strategy.usesCursor {
+                nextCursor = hasNext ? cursorPair.next : nil
+            } else {
+                nextCursor = nil
+            }
+
+            let output = RowPagePreview(
+                columns: pagingPlan.columns,
+                rows: rows,
+                limit: pageLimit,
+                offset: logicalOffset,
+                hasNext: nextCursor != nil || (hasNext && !queryPlan.strategy.usesCursor),
+                strategy: queryPlan.strategy,
+                orderedByColumn: queryPlan.orderColumn,
+                nextCursor: nextCursor,
+                previousCursor: cursorPair.previous
+            )
+
+            let elapsedMS = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            logger.debug(
+                "fetchRowsPreview completed",
+                metadata: [
+                    "table": "\(table.fullName)",
+                    "strategy": "\(output.strategy.rawValue)",
+                    "direction": "\(request.direction.rawValue)",
+                    "previewChars": "\(previewLimit)",
+                    "rows": "\(rows.count)",
+                    "ms": "\(elapsedMS)",
+                ]
+            )
+
+            return output
+        }
+    }
+
+    func fetchCellValue(database: DatabaseRef, table: TableRef, rowIdentity: RowIdentity, columnName: String) async throws -> String {
+        let instance = try await resolveInstance(for: database)
+        let safeSchema = Self.quoteIdentifier(table.schema)
+        let safeTable = Self.quoteIdentifier(table.name)
+        let safeColumn = Self.quoteIdentifier(columnName)
+
+        return try await sessionPool.withConnection(instance: instance, database: database.name) { connection, logger in
+            let start = CFAbsoluteTimeGetCurrent()
+            let lookupPlan = Self.makeLookupPlan(for: rowIdentity)
+
+            let sql: String
+            switch lookupPlan {
+            case .offset(let offset):
+                sql = "SELECT \(safeColumn) FROM \(safeSchema).\(safeTable) LIMIT 1 OFFSET \(max(0, offset))"
+            case .columnValue(let column, let literal):
+                let safeLookupColumn = Self.quoteIdentifier(column)
+                sql = "SELECT \(safeColumn) FROM \(safeSchema).\(safeTable) WHERE \(safeLookupColumn) = \(literal) LIMIT 1"
+            case .ctid(let literal):
+                sql = "SELECT \(safeColumn) FROM \(safeSchema).\(safeTable) WHERE ctid = \(literal) LIMIT 1"
+            }
+
+            let sequence = try await connection.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+            let rows = try await sequence.collect()
+            guard let firstRow = rows.first,
+                  let firstCell = firstRow.first else {
+                return ""
+            }
+
+            let value = Self.displayValue(firstCell)
+            let elapsedMS = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            logger.debug(
+                "fetchCellValue completed",
+                metadata: [
+                    "table": "\(table.fullName)",
+                    "column": "\(columnName)",
+                    "lookup": "\(String(describing: lookupPlan))",
+                    "ms": "\(elapsedMS)",
+                ]
+            )
+            return value
         }
     }
 
@@ -625,6 +796,71 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
             return (previous, next)
         case .offset:
             return (nil, nil)
+        }
+    }
+
+    static func makePreviewCellValue(value: String, maxChars: Int) -> TableCellValue {
+        let limit = max(16, maxChars)
+        guard let cutoffIndex = value.index(value.startIndex, offsetBy: limit, limitedBy: value.endIndex) else {
+            return TableCellValue(previewText: value, isTruncated: false)
+        }
+        guard cutoffIndex < value.endIndex else {
+            return TableCellValue(previewText: value, isTruncated: false)
+        }
+
+        let preview = String(value[..<cutoffIndex]) + "…"
+        return TableCellValue(previewText: preview, isTruncated: true)
+    }
+
+    private static func makeRowIdentity(
+        strategy: RowPagingStrategy,
+        orderColumn: String?,
+        orderType: KeysetValueType?,
+        row: [String],
+        hiddenCursor: String?,
+        columns: [String],
+        fallbackOffset: Int
+    ) -> RowIdentity {
+        switch strategy {
+        case .keysetID, .keysetPrimaryKey:
+            guard let orderColumn,
+                  let orderType,
+                  let valueType = orderType.rowIdentityValueType,
+                  let index = columns.firstIndex(of: orderColumn),
+                  let value = row[safe: index] else {
+                return .offset(fallbackOffset)
+            }
+            return .columnValue(column: orderColumn, value: value, valueType: valueType)
+        case .keysetCTID:
+            guard let hiddenCursor else {
+                return .offset(fallbackOffset)
+            }
+            return .ctid(hiddenCursor)
+        case .offset:
+            return .offset(fallbackOffset)
+        }
+    }
+
+    static func makeLookupPlan(for rowIdentity: RowIdentity) -> FullValueLookupPlan {
+        switch rowIdentity {
+        case .offset(let value):
+            return .offset(max(0, value))
+        case .columnValue(let column, let value, let valueType):
+            let literal: String
+            switch valueType {
+            case .numeric:
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty, Double(trimmed) != nil {
+                    literal = trimmed
+                } else {
+                    literal = "0"
+                }
+            case .textual:
+                literal = "'\(escapeSQLLiteral(value))'"
+            }
+            return .columnValue(column: column, literal: literal)
+        case .ctid(let ctid):
+            return .ctid(literal: "'\(escapeSQLLiteral(ctid))'::tid")
         }
     }
 

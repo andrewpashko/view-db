@@ -59,15 +59,24 @@ private actor MockQueryService: QueryService {
     private(set) var fetchedRequests: [RowPageRequest] = []
     var rowCountDelayMS: UInt64 = 0
 
-    private let initialPage: RowPage
-    private let nextPage: RowPage
-    private let previousPage: RowPage
+    private let initialPreviewPage: RowPagePreview
+    private let nextPreviewPage: RowPagePreview
+    private let previousPreviewPage: RowPagePreview
     private let rowCountValue: Int
 
     init(
-        initialPage: RowPage = RowPage(
+        initialPreviewPage: RowPagePreview = RowPagePreview(
             columns: ["id", "name"],
-            rows: [["1", "demo"]],
+            rows: [
+                TableRowItem(
+                    id: 0,
+                    identity: .offset(0),
+                    values: [
+                        TableCellValue(previewText: "1", isTruncated: false),
+                        TableCellValue(previewText: "demo", isTruncated: false),
+                    ]
+                ),
+            ],
             limit: 100,
             offset: 0,
             hasNext: false,
@@ -76,27 +85,54 @@ private actor MockQueryService: QueryService {
             nextCursor: nil,
             previousCursor: nil
         ),
-        nextPage: RowPage? = nil,
-        previousPage: RowPage? = nil,
+        nextPreviewPage: RowPagePreview? = nil,
+        previousPreviewPage: RowPagePreview? = nil,
         rowCountValue: Int = 1
     ) {
-        self.initialPage = initialPage
-        self.nextPage = nextPage ?? initialPage
-        self.previousPage = previousPage ?? initialPage
+        self.initialPreviewPage = initialPreviewPage
+        self.nextPreviewPage = nextPreviewPage ?? initialPreviewPage
+        self.previousPreviewPage = previousPreviewPage ?? initialPreviewPage
         self.rowCountValue = rowCountValue
     }
 
     func fetchRows(database: DatabaseRef, table: TableRef, request: RowPageRequest) async throws -> RowPage {
+        let preview = try await fetchRowsPreview(database: database, table: table, request: request, previewLimitChars: 256)
+        let rows = preview.rows.map { row in
+            row.values.map(\.previewText)
+        }
+        return RowPage(
+            columns: preview.columns,
+            rows: rows,
+            limit: preview.limit,
+            offset: preview.offset,
+            hasNext: preview.hasNext,
+            strategy: preview.strategy,
+            orderedByColumn: preview.orderedByColumn,
+            nextCursor: preview.nextCursor,
+            previousCursor: preview.previousCursor
+        )
+    }
+
+    func fetchRowsPreview(
+        database: DatabaseRef,
+        table: TableRef,
+        request: RowPageRequest,
+        previewLimitChars: Int
+    ) async throws -> RowPagePreview {
         fetchedTableNames.append(table.name)
         fetchedRequests.append(request)
         switch request.direction {
         case .initial:
-            return initialPage
+            return initialPreviewPage
         case .next:
-            return nextPage
+            return nextPreviewPage
         case .previous:
-            return previousPage
+            return previousPreviewPage
         }
+    }
+
+    func fetchCellValue(database: DatabaseRef, table: TableRef, rowIdentity: RowIdentity, columnName: String) async throws -> String {
+        "full-\(columnName)"
     }
 
     func fetchRowCount(database: DatabaseRef, table: TableRef) async throws -> Int {
@@ -318,9 +354,26 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
         let table = TableRef(databaseID: database.id, schema: "public", name: "events")
         let tables = [table]
 
-        let firstPage = RowPage(
+        let firstPage = RowPagePreview(
             columns: ["id", "name"],
-            rows: [["1", "a"], ["2", "b"]],
+            rows: [
+                TableRowItem(
+                    id: 0,
+                    identity: .columnValue(column: "id", value: "1", valueType: .numeric),
+                    values: [
+                        TableCellValue(previewText: "1", isTruncated: false),
+                        TableCellValue(previewText: "a", isTruncated: false),
+                    ]
+                ),
+                TableRowItem(
+                    id: 1,
+                    identity: .columnValue(column: "id", value: "2", valueType: .numeric),
+                    values: [
+                        TableCellValue(previewText: "2", isTruncated: false),
+                        TableCellValue(previewText: "b", isTruncated: false),
+                    ]
+                ),
+            ],
             limit: 2,
             offset: 0,
             hasNext: true,
@@ -329,9 +382,26 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             nextCursor: "2",
             previousCursor: "1"
         )
-        let secondPage = RowPage(
+        let secondPage = RowPagePreview(
             columns: ["id", "name"],
-            rows: [["3", "c"], ["4", "d"]],
+            rows: [
+                TableRowItem(
+                    id: 2,
+                    identity: .columnValue(column: "id", value: "3", valueType: .numeric),
+                    values: [
+                        TableCellValue(previewText: "3", isTruncated: false),
+                        TableCellValue(previewText: "c", isTruncated: false),
+                    ]
+                ),
+                TableRowItem(
+                    id: 3,
+                    identity: .columnValue(column: "id", value: "4", valueType: .numeric),
+                    values: [
+                        TableCellValue(previewText: "4", isTruncated: false),
+                        TableCellValue(previewText: "d", isTruncated: false),
+                    ]
+                ),
+            ],
             limit: 2,
             offset: 2,
             hasNext: true,
@@ -344,9 +414,9 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
         let lookup = MockInstanceLookupService(instance: instance)
         let catalog = MockCatalogService(databaseNames: [database.name], tables: tables)
         let query = MockQueryService(
-            initialPage: firstPage,
-            nextPage: secondPage,
-            previousPage: firstPage,
+            initialPreviewPage: firstPage,
+            nextPreviewPage: secondPage,
+            previousPreviewPage: firstPage,
             rowCountValue: 4
         )
         let credentials = MockCredentialService()
@@ -394,9 +464,18 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
         let table = TableRef(databaseID: database.id, schema: "public", name: "events")
         let tables = [table]
 
-        let initialPage = RowPage(
+        let initialPage = RowPagePreview(
             columns: ["id", "name"],
-            rows: [["1", "a"]],
+            rows: [
+                TableRowItem(
+                    id: 0,
+                    identity: .offset(0),
+                    values: [
+                        TableCellValue(previewText: "1", isTruncated: false),
+                        TableCellValue(previewText: "a", isTruncated: false),
+                    ]
+                ),
+            ],
             limit: 1,
             offset: 0,
             hasNext: false,
@@ -408,7 +487,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
 
         let lookup = MockInstanceLookupService(instance: instance)
         let catalog = MockCatalogService(databaseNames: [database.name], tables: tables)
-        let query = MockQueryService(initialPage: initialPage, rowCountValue: 5_109)
+        let query = MockQueryService(initialPreviewPage: initialPage, rowCountValue: 5_109)
         await query.setRowCountDelay(milliseconds: 400)
         let credentials = MockCredentialService()
 
