@@ -44,7 +44,7 @@ final class DatabaseViewModel {
 
     private let maxRowsPerPage = 500
 
-    var rowsPerPage = 200
+    var rowsPerPage = 100
     let rowsPerPageOptions = [50, 100, 200, 500]
 
     var tableSearch = "" {
@@ -64,6 +64,7 @@ final class DatabaseViewModel {
     private var rowTask: Task<Void, Never>?
     private var tableTask: Task<Void, Never>?
     private var sqlTask: Task<Void, Never>?
+    private var countTask: Task<Void, Never>?
 
     init(
         database: DatabaseRef,
@@ -109,25 +110,78 @@ final class DatabaseViewModel {
     func selectTable(_ table: TableRef) {
         guard selectedTable != table else { return }
         selectedTable = table
-        fetchRows(limit: rowsPerPage, offset: 0, refreshCount: true)
+        fetchRows(
+            request: RowPageRequest(
+                limit: rowsPerPage,
+                direction: .initial,
+                offset: 0
+            ),
+            refreshCount: true
+        )
     }
 
     func fetchNextPage() {
         guard rowPage.hasNext else { return }
-        fetchRows(limit: rowsPerPage, offset: rowPage.offset + pageSize)
+        let nextOffset = rowPage.offset + pageSize
+
+        if rowPage.strategy.usesCursor {
+            guard let cursor = rowPage.nextCursor else { return }
+            fetchRows(
+                request: RowPageRequest(
+                    limit: rowsPerPage,
+                    direction: .next,
+                    offset: nextOffset,
+                    cursor: cursor
+                )
+            )
+            return
+        }
+
+        fetchRows(
+            request: RowPageRequest(
+                limit: rowsPerPage,
+                direction: .next,
+                offset: nextOffset
+            )
+        )
     }
 
     func fetchPreviousPage() {
         guard selectedTable != nil else { return }
         let newOffset = max(0, rowPage.offset - pageSize)
-        fetchRows(limit: rowsPerPage, offset: newOffset)
+        if rowPage.strategy.usesCursor, let cursor = rowPage.previousCursor {
+            fetchRows(
+                request: RowPageRequest(
+                    limit: rowsPerPage,
+                    direction: .previous,
+                    offset: newOffset,
+                    cursor: cursor
+                )
+            )
+            return
+        }
+
+        fetchRows(
+            request: RowPageRequest(
+                limit: rowsPerPage,
+                direction: .previous,
+                offset: newOffset
+            )
+        )
     }
 
     func updateRowsPerPage(_ value: Int) {
         let normalized = min(max(1, value), maxRowsPerPage)
         guard rowsPerPage != normalized else { return }
         rowsPerPage = normalized
-        fetchRows(limit: normalized, offset: 0)
+        fetchRows(
+            request: RowPageRequest(
+                limit: normalized,
+                direction: .initial,
+                offset: 0
+            ),
+            refreshCount: true
+        )
     }
 
     func openSQLSheet() {
@@ -195,10 +249,24 @@ final class DatabaseViewModel {
             if let selectedTable,
                let match = tables.first(where: { $0.id == selectedTable.id }) {
                 self.selectedTable = match
-                fetchRows(limit: rowsPerPage, offset: rowPage.offset, refreshCount: true)
+                fetchRows(
+                    request: RowPageRequest(
+                        limit: rowsPerPage,
+                        direction: .initial,
+                        offset: rowPage.offset
+                    ),
+                    refreshCount: true
+                )
             } else if let first = tables.first {
                 selectedTable = first
-                fetchRows(limit: rowsPerPage, offset: 0, refreshCount: true)
+                fetchRows(
+                    request: RowPageRequest(
+                        limit: rowsPerPage,
+                        direction: .initial,
+                        offset: 0
+                    ),
+                    refreshCount: true
+                )
             } else {
                 rowPage = .empty
                 totalRowCount = nil
@@ -210,7 +278,7 @@ final class DatabaseViewModel {
         isLoadingTables = false
     }
 
-    private func fetchRows(limit: Int, offset: Int, refreshCount: Bool = false) {
+    private func fetchRows(request: RowPageRequest, refreshCount: Bool = false) {
         guard let selectedTable else {
             rowPage = .empty
             totalRowCount = nil
@@ -218,22 +286,24 @@ final class DatabaseViewModel {
         }
 
         if refreshCount {
+            countTask?.cancel()
             totalRowCount = nil
         }
 
         rowTask?.cancel()
         rowTask = Task { [weak self] in
             guard let self else { return }
-            await self.fetchRowsImpl(table: selectedTable, limit: limit, offset: offset, refreshCount: refreshCount)
+            await self.fetchRowsImpl(table: selectedTable, request: request, refreshCount: refreshCount)
         }
     }
 
-    private func fetchRowsImpl(table: TableRef, limit: Int, offset: Int, refreshCount: Bool) async {
+    private func fetchRowsImpl(table: TableRef, request: RowPageRequest, refreshCount: Bool) async {
         isLoadingRows = true
         errorMessage = nil
+        defer { isLoadingRows = false }
 
         do {
-            let page = try await queryService.fetchRows(database: database, table: table, limit: limit, offset: offset)
+            let page = try await queryService.fetchRows(database: database, table: table, request: request)
             if Task.isCancelled { return }
             rowPage = page
             if rowsPerPage != page.limit {
@@ -241,20 +311,12 @@ final class DatabaseViewModel {
             }
 
             if refreshCount || totalRowCount == nil {
-                do {
-                    let count = try await queryService.fetchRowCount(database: database, table: table)
-                    if Task.isCancelled { return }
-                    totalRowCount = max(0, count)
-                } catch {
-                    totalRowCount = nil
-                }
+                fetchRowCount(table: table)
             }
         } catch {
             handle(error: error, instance: instance, forSQL: false)
             totalRowCount = nil
         }
-
-        isLoadingRows = false
     }
 
     private func runSQLImpl() async {
@@ -305,6 +367,24 @@ final class DatabaseViewModel {
                 TableSection(schema: schema, tables: tables.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
             }
             .sorted { $0.schema.localizedCaseInsensitiveCompare($1.schema) == .orderedAscending }
+    }
+
+    private func fetchRowCount(table: TableRef) {
+        countTask?.cancel()
+        countTask = Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                let count = try await self.queryService.fetchRowCount(database: self.database, table: table)
+                if Task.isCancelled { return }
+                guard self.selectedTable?.id == table.id else { return }
+                self.totalRowCount = max(0, count)
+            } catch {
+                if Task.isCancelled { return }
+                guard self.selectedTable?.id == table.id else { return }
+                self.totalRowCount = nil
+            }
+        }
     }
 
     private var pageSize: Int {

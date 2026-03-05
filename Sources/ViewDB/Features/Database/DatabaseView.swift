@@ -27,6 +27,9 @@ struct DatabaseView: View {
         .navigationTitle(database.name)
         .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                toolbarTitleLabel
+            }
             ToolbarItem(placement: .primaryAction) {
                 toolbarControls
             }
@@ -116,24 +119,26 @@ struct DatabaseView: View {
         ZStack {
             Color(nsColor: .controlBackgroundColor).opacity(0.94)
 
-            VStack(alignment: .leading, spacing: 12) {
-                if viewModel.isLoadingRows {
-                    ProgressView("Loading rows...")
-                        .padding(.vertical, 10)
-                }
-
-                if let selectedTable = viewModel.selectedTable {
-                    tableContent(selectedTable)
-                    pagingControls
-                } else {
-                    ContentUnavailableView(
-                        "No Table Selected",
-                        systemImage: "tablecells",
-                        description: Text("Choose a table from the sidebar.")
-                    )
-                }
+            if let selectedTable = viewModel.selectedTable {
+                tableContent(selectedTable)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
+                    .padding(.bottom, 16)
+            } else {
+                ContentUnavailableView(
+                    "No Table Selected",
+                    systemImage: "tablecells",
+                    description: Text("Choose a table from the sidebar.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .padding(16)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if viewModel.selectedTable != nil {
+                pagingControls
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -145,49 +150,79 @@ struct DatabaseView: View {
             Text(database.name)
                 .font(.headline.weight(.semibold))
                 .lineLimit(1)
+
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Loading…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: 86, alignment: .leading)
+            .opacity(viewModel.isLoadingTables ? 1 : 0)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Loading tables")
+            .accessibilityHidden(!viewModel.isLoadingTables)
         }
         .fixedSize(horizontal: true, vertical: false)
     }
 
     @ViewBuilder
     private func tableContent(_ table: TableRef) -> some View {
-        Text(table.fullName)
-            .font(.system(.headline, design: .monospaced))
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Text(table.fullName)
+                    .font(.system(.headline, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
 
-        if viewModel.rowPage.columns.isEmpty {
-            ContentUnavailableView(
-                "No Rows",
-                systemImage: "tray",
-                description: Text("The table returned no data.")
-            )
-        } else {
-            DataGridView(columns: viewModel.rowPage.columns, rows: viewModel.tableRows)
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 86, alignment: .leading)
+                .opacity(viewModel.isLoadingRows ? 1 : 0)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Loading rows")
+                .accessibilityHidden(!viewModel.isLoadingRows)
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+
+            if viewModel.rowPage.columns.isEmpty {
+                ContentUnavailableView(
+                    "No Rows",
+                    systemImage: "tray",
+                    description: Text("The table returned no data.")
+                )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                DataGridView(columns: viewModel.rowPage.columns, rows: viewModel.tableRows)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .transaction { transaction in
+                        transaction.animation = nil
+                    }
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var pagingControls: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Text("Rows:")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+            rowsPerPageControl
 
-                Picker("Rows per page", selection: rowsPerPageBinding) {
-                    ForEach(viewModel.rowsPerPageOptions, id: \.self) { value in
-                        Text("\(value)").tag(value)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 88)
-            }
+            Divider()
+                .frame(height: 28)
 
-            Text("Page \(viewModel.currentPage) of \(viewModel.totalPages)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            pagingMetric(icon: "doc.text", title: "Page", value: "\(viewModel.currentPage) / \(viewModel.totalPages)")
+            pagingMetric(icon: "line.3.horizontal", title: "Showing", value: visibleRangeText)
+            pagingMetric(icon: "sum", title: "Total Entries", value: totalEntriesText)
 
-            Spacer()
+            Spacer(minLength: 12)
 
             if #available(macOS 26.0, *) {
                 GlassEffectContainer(spacing: 8) {
@@ -196,6 +231,13 @@ struct DatabaseView: View {
             } else {
                 pagingButtons
             }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .viewDBGlassCard(cornerRadius: 12)
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
         }
     }
 
@@ -235,17 +277,73 @@ struct DatabaseView: View {
 
     private var pagingButtons: some View {
         HStack(spacing: 8) {
-            Button("Previous") {
+            Button {
                 viewModel.fetchPreviousPage()
+            } label: {
+                Label("Previous", systemImage: "chevron.left")
             }
             .viewDBGlassButton()
             .disabled(viewModel.rowPage.offset == 0 || viewModel.isLoadingRows)
 
-            Button("Next") {
+            Button {
                 viewModel.fetchNextPage()
+            } label: {
+                Label("Next", systemImage: "chevron.right")
             }
             .viewDBGlassButton(prominent: true)
             .disabled(!viewModel.rowPage.hasNext || viewModel.isLoadingRows)
         }
     }
+
+    private var rowsPerPageControl: some View {
+        HStack(spacing: 8) {
+            Text("Rows")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+
+            Picker("Rows per page", selection: rowsPerPageBinding) {
+                ForEach(viewModel.rowsPerPageOptions, id: \.self) { value in
+                    Text("\(value)").tag(value)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 88)
+        }
+        .padding(.horizontal, 6)
+    }
+
+    private func pagingMetric(icon: String, title: String, value: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text(value)
+                .font(.system(.caption, design: .monospaced).weight(.semibold))
+                .foregroundStyle(.primary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var visibleRangeText: String {
+        let count = viewModel.rowPage.rows.count
+        guard count > 0 else { return "0-0" }
+
+        let start = viewModel.rowPage.offset + 1
+        let end = viewModel.rowPage.offset + count
+        return "\(start.formatted())-\(end.formatted())"
+    }
+
+    private var totalEntriesText: String {
+        if let total = viewModel.totalRowCount {
+            return total.formatted()
+        }
+        return viewModel.isLoadingRows ? "…" : "—"
+    }
+
 }

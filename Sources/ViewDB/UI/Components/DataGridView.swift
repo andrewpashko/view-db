@@ -4,10 +4,7 @@ struct DataGridView: View {
     let columns: [String]
     let rows: [TableRowItem]
 
-    @State private var hoveredRowID: TableRowItem.ID?
-
     private let columnWidth: CGFloat = 170
-    private let hoverRowBackground = Color.accentColor.opacity(0.08)
     private var tableColumns: [GridColumn] {
         Array(columns.enumerated()).map { index, title in
             GridColumn(id: index, title: title)
@@ -36,19 +33,9 @@ struct DataGridView: View {
             .font(.system(.callout, design: .monospaced))
             .lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8)
+            // Keep row text start aligned with native Table header title insets.
+            .padding(.trailing, 8)
             .padding(.vertical, 4)
-            .background(hoveredRowID == row.id ? hoverRowBackground : Color.clear)
-            .contentShape(Rectangle())
-            .onHover { isHovered in
-                if isHovered {
-                    if hoveredRowID != row.id {
-                        hoveredRowID = row.id
-                    }
-                } else if hoveredRowID == row.id {
-                    hoveredRowID = nil
-                }
-            }
     }
 
     private struct GridColumn: Identifiable {

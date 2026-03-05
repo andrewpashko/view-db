@@ -13,6 +13,7 @@ private struct StaticDiscoveryProvider: DiscoveryProvider {
 private actor MockCatalogService: CatalogService {
     let databaseNames: [String]
     let tables: [TableRef]
+    var listTablesDelayMS: UInt64 = 0
 
     init(databaseNames: [String], tables: [TableRef] = []) {
         self.databaseNames = databaseNames
@@ -30,7 +31,14 @@ private actor MockCatalogService: CatalogService {
     }
 
     func listTables(on database: DatabaseRef) async throws -> [TableRef] {
-        tables
+        if listTablesDelayMS > 0 {
+            try? await Task.sleep(for: .milliseconds(Int(listTablesDelayMS)))
+        }
+        return tables
+    }
+
+    func setListTablesDelay(milliseconds: UInt64) {
+        listTablesDelayMS = milliseconds
     }
 }
 
@@ -48,24 +56,68 @@ private actor MockInstanceLookupService: InstanceLookupService {
 
 private actor MockQueryService: QueryService {
     private(set) var fetchedTableNames: [String] = []
+    private(set) var fetchedRequests: [RowPageRequest] = []
+    var rowCountDelayMS: UInt64 = 0
 
-    func fetchRows(database: DatabaseRef, table: TableRef, limit: Int, offset: Int) async throws -> RowPage {
-        fetchedTableNames.append(table.name)
-        return RowPage(
+    private let initialPage: RowPage
+    private let nextPage: RowPage
+    private let previousPage: RowPage
+    private let rowCountValue: Int
+
+    init(
+        initialPage: RowPage = RowPage(
             columns: ["id", "name"],
             rows: [["1", "demo"]],
-            limit: limit,
-            offset: offset,
-            hasNext: false
-        )
+            limit: 100,
+            offset: 0,
+            hasNext: false,
+            strategy: .offset,
+            orderedByColumn: nil,
+            nextCursor: nil,
+            previousCursor: nil
+        ),
+        nextPage: RowPage? = nil,
+        previousPage: RowPage? = nil,
+        rowCountValue: Int = 1
+    ) {
+        self.initialPage = initialPage
+        self.nextPage = nextPage ?? initialPage
+        self.previousPage = previousPage ?? initialPage
+        self.rowCountValue = rowCountValue
+    }
+
+    func fetchRows(database: DatabaseRef, table: TableRef, request: RowPageRequest) async throws -> RowPage {
+        fetchedTableNames.append(table.name)
+        fetchedRequests.append(request)
+        switch request.direction {
+        case .initial:
+            return initialPage
+        case .next:
+            return nextPage
+        case .previous:
+            return previousPage
+        }
     }
 
     func fetchRowCount(database: DatabaseRef, table: TableRef) async throws -> Int {
-        1
+        if rowCountDelayMS > 0 {
+            try? await Task.sleep(for: .milliseconds(Int(rowCountDelayMS)))
+        }
+        return rowCountValue
     }
 
     func runReadOnlySQL(database: DatabaseRef, sql: String, limit: Int) async throws -> RowPage {
-        RowPage(columns: ["value"], rows: [["1"]], limit: limit, offset: 0, hasNext: false)
+        RowPage(
+            columns: ["value"],
+            rows: [["1"]],
+            limit: limit,
+            offset: 0,
+            hasNext: false,
+            strategy: .offset,
+            orderedByColumn: nil,
+            nextCursor: nil,
+            previousCursor: nil
+        )
     }
 
     func lastFetchedTableName() -> String? {
@@ -74,6 +126,14 @@ private actor MockQueryService: QueryService {
 
     func fetchCount() -> Int {
         fetchedTableNames.count
+    }
+
+    func requests() -> [RowPageRequest] {
+        fetchedRequests
+    }
+
+    func setRowCountDelay(milliseconds: UInt64) {
+        rowCountDelayMS = milliseconds
     }
 }
 
@@ -243,5 +303,168 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
 
         let lastFetchedTable = await query.lastFetchedTableName()
         XCTAssertEqual(lastFetchedTable, "users")
+    }
+
+    func testDatabaseViewModelUsesCursorForKeysetNextAndPrevious() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let database = DatabaseRef(instanceID: instance.id, name: "app_db")
+        let table = TableRef(databaseID: database.id, schema: "public", name: "events")
+        let tables = [table]
+
+        let firstPage = RowPage(
+            columns: ["id", "name"],
+            rows: [["1", "a"], ["2", "b"]],
+            limit: 2,
+            offset: 0,
+            hasNext: true,
+            strategy: .keysetID,
+            orderedByColumn: "id",
+            nextCursor: "2",
+            previousCursor: "1"
+        )
+        let secondPage = RowPage(
+            columns: ["id", "name"],
+            rows: [["3", "c"], ["4", "d"]],
+            limit: 2,
+            offset: 2,
+            hasNext: true,
+            strategy: .keysetID,
+            orderedByColumn: "id",
+            nextCursor: "4",
+            previousCursor: "3"
+        )
+
+        let lookup = MockInstanceLookupService(instance: instance)
+        let catalog = MockCatalogService(databaseNames: [database.name], tables: tables)
+        let query = MockQueryService(
+            initialPage: firstPage,
+            nextPage: secondPage,
+            previousPage: firstPage,
+            rowCountValue: 4
+        )
+        let credentials = MockCredentialService()
+
+        let vm = DatabaseViewModel(
+            database: database,
+            instanceLookup: lookup,
+            catalogService: catalog,
+            queryService: query,
+            credentialService: credentials
+        )
+
+        await vm.loadNow()
+        try? await Task.sleep(for: .milliseconds(120))
+
+        vm.fetchNextPage()
+        try? await Task.sleep(for: .milliseconds(120))
+
+        vm.fetchPreviousPage()
+        try? await Task.sleep(for: .milliseconds(120))
+
+        let requests = await query.requests()
+        XCTAssertEqual(requests.count, 3)
+        XCTAssertEqual(requests[0].direction, .initial)
+
+        XCTAssertEqual(requests[1].direction, .next)
+        XCTAssertEqual(requests[1].cursor, "2")
+        XCTAssertEqual(requests[1].offset, 2)
+
+        XCTAssertEqual(requests[2].direction, .previous)
+        XCTAssertEqual(requests[2].cursor, "3")
+        XCTAssertEqual(requests[2].offset, 0)
+    }
+
+    func testDatabaseViewModelLoadsRowsBeforeLazyCountCompletes() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let database = DatabaseRef(instanceID: instance.id, name: "app_db")
+        let table = TableRef(databaseID: database.id, schema: "public", name: "events")
+        let tables = [table]
+
+        let initialPage = RowPage(
+            columns: ["id", "name"],
+            rows: [["1", "a"]],
+            limit: 1,
+            offset: 0,
+            hasNext: false,
+            strategy: .offset,
+            orderedByColumn: nil,
+            nextCursor: nil,
+            previousCursor: nil
+        )
+
+        let lookup = MockInstanceLookupService(instance: instance)
+        let catalog = MockCatalogService(databaseNames: [database.name], tables: tables)
+        let query = MockQueryService(initialPage: initialPage, rowCountValue: 5_109)
+        await query.setRowCountDelay(milliseconds: 400)
+        let credentials = MockCredentialService()
+
+        let vm = DatabaseViewModel(
+            database: database,
+            instanceLookup: lookup,
+            catalogService: catalog,
+            queryService: query,
+            credentialService: credentials
+        )
+
+        await vm.loadNow()
+        try? await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(vm.tableRows.count, 1)
+        XCTAssertNil(vm.totalRowCount)
+
+        try? await Task.sleep(for: .milliseconds(450))
+        XCTAssertEqual(vm.totalRowCount, 5_109)
+    }
+
+    func testDatabaseViewModelTracksTableLoadingStateDuringLoad() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let database = DatabaseRef(instanceID: instance.id, name: "app_db")
+        let table = TableRef(databaseID: database.id, schema: "public", name: "events")
+        let tables = [table]
+
+        let lookup = MockInstanceLookupService(instance: instance)
+        let catalog = MockCatalogService(databaseNames: [database.name], tables: tables)
+        await catalog.setListTablesDelay(milliseconds: 350)
+        let query = MockQueryService()
+        let credentials = MockCredentialService()
+
+        let vm = DatabaseViewModel(
+            database: database,
+            instanceLookup: lookup,
+            catalogService: catalog,
+            queryService: query,
+            credentialService: credentials
+        )
+
+        let loadTask = Task {
+            await vm.loadNow()
+        }
+
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(vm.isLoadingTables)
+
+        await loadTask.value
+        XCTAssertFalse(vm.isLoadingTables)
     }
 }
