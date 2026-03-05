@@ -8,6 +8,7 @@ struct DiscoveredInstance: Identifiable, Hashable, Codable, Sendable {
     let port: Int?
     let socketPath: String?
     let defaultUser: String?
+    let defaultPassword: String?
     let defaultDatabase: String?
     let containerID: String?
 
@@ -18,6 +19,7 @@ struct DiscoveredInstance: Identifiable, Hashable, Codable, Sendable {
         port: Int?,
         socketPath: String?,
         defaultUser: String? = nil,
+        defaultPassword: String? = nil,
         defaultDatabase: String? = nil,
         containerID: String? = nil
     ) {
@@ -27,6 +29,7 @@ struct DiscoveredInstance: Identifiable, Hashable, Codable, Sendable {
         self.port = port
         self.socketPath = socketPath
         self.defaultUser = defaultUser
+        self.defaultPassword = defaultPassword
         self.defaultDatabase = defaultDatabase
         self.containerID = containerID
         self.id = StableID.uuid(for: [

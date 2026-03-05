@@ -107,6 +107,24 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         }
     }
 
+    func fetchRowCount(database: DatabaseRef, table: TableRef) async throws -> Int {
+        let instance = try await resolveInstance(for: database)
+        let safeSchema = quoteIdentifier(table.schema)
+        let safeTable = quoteIdentifier(table.name)
+
+        return try await sessionPool.withConnection(instance: instance, database: database.name) { connection, logger in
+            let query = PostgresQuery(unsafeSQL: "SELECT COUNT(*) FROM \(safeSchema).\(safeTable)")
+            let sequence = try await connection.query(query, logger: logger)
+            let rows = try await sequence.collect()
+            guard let row = rows.first,
+                  let cell = row.first,
+                  let count = try? cell.decode(Int64.self) else {
+                return 0
+            }
+            return Int(clamping: count)
+        }
+    }
+
     func runReadOnlySQL(database: DatabaseRef, sql: String, limit: Int) async throws -> RowPage {
         try SQLGuard.validateReadOnly(sql)
         let instance = try await resolveInstance(for: database)

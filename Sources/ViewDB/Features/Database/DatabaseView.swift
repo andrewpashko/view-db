@@ -25,6 +25,7 @@ struct DatabaseView: View {
             detail
         }
         .navigationTitle(database.name)
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 toolbarControls
@@ -34,6 +35,7 @@ struct DatabaseView: View {
             SQLSheetView(
                 sqlText: $viewModel.sqlText,
                 rowPage: viewModel.sqlRowPage,
+                rows: viewModel.sqlRows,
                 isRunning: viewModel.isRunningSQL,
                 errorMessage: viewModel.sqlErrorMessage,
                 onRun: viewModel.runSQL
@@ -76,7 +78,7 @@ struct DatabaseView: View {
                                 } label: {
                                     HStack {
                                         Text(table.name)
-                                            .font(.system(.body, design: .monospaced))
+                                            .font(.system(.callout, design: .monospaced))
                                         Spacer(minLength: 0)
                                     }
                                     .padding(.horizontal, 8)
@@ -115,8 +117,6 @@ struct DatabaseView: View {
             Color(nsColor: .controlBackgroundColor).opacity(0.94)
 
             VStack(alignment: .leading, spacing: 12) {
-                header
-
                 if viewModel.isLoadingRows {
                     ProgressView("Loading rows...")
                         .padding(.vertical, 10)
@@ -138,22 +138,15 @@ struct DatabaseView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    @ViewBuilder
-    private var header: some View {
-        let subtitle = viewModel.instance?.endpointLabel ?? "Local instance"
-        if #available(macOS 26.0, *) {
-            GlassEffectContainer(spacing: 8) {
-                DatabaseHeaderChipView(
-                    title: database.name,
-                    subtitle: subtitle
-                )
-            }
-        } else {
-            DatabaseHeaderChipView(
-                title: database.name,
-                subtitle: subtitle
-            )
+    private var toolbarTitleLabel: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "cylinder.split.1x2")
+                .font(.headline)
+            Text(database.name)
+                .font(.headline.weight(.semibold))
+                .lineLimit(1)
         }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     @ViewBuilder
@@ -175,7 +168,22 @@ struct DatabaseView: View {
 
     private var pagingControls: some View {
         HStack(spacing: 10) {
-            Text("Rows: \(viewModel.rowPage.rows.count)")
+            HStack(spacing: 6) {
+                Text("Rows:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("Rows per page", selection: rowsPerPageBinding) {
+                    ForEach(viewModel.rowsPerPageOptions, id: \.self) { value in
+                        Text("\(value)").tag(value)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 88)
+            }
+
+            Text("Page \(viewModel.currentPage) of \(viewModel.totalPages)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -189,6 +197,13 @@ struct DatabaseView: View {
                 pagingButtons
             }
         }
+    }
+
+    private var rowsPerPageBinding: Binding<Int> {
+        Binding(
+            get: { viewModel.rowsPerPage },
+            set: { viewModel.updateRowsPerPage($0) }
+        )
     }
 
     @ViewBuilder

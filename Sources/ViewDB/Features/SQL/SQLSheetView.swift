@@ -4,15 +4,10 @@ struct SQLSheetView: View {
     @Binding var sqlText: String
 
     let rowPage: RowPage
+    let rows: [TableRowItem]
     let isRunning: Bool
     let errorMessage: String?
     let onRun: () -> Void
-
-    private var rows: [TableRowItem] {
-        rowPage.rows.enumerated().map { index, values in
-            TableRowItem(id: index, values: values)
-        }
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -51,7 +46,7 @@ struct SQLSheetView: View {
                 Spacer()
             } else {
                 DataGridView(columns: rowPage.columns, rows: rows)
-                .frame(minHeight: 220)
+                    .frame(minHeight: 220)
             }
         }
         .padding(16)

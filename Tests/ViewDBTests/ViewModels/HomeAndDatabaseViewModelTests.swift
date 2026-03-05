@@ -60,6 +60,10 @@ private actor MockQueryService: QueryService {
         )
     }
 
+    func fetchRowCount(database: DatabaseRef, table: TableRef) async throws -> Int {
+        1
+    }
+
     func runReadOnlySQL(database: DatabaseRef, sql: String, limit: Int) async throws -> RowPage {
         RowPage(columns: ["value"], rows: [["1"]], limit: limit, offset: 0, hasNext: false)
     }
@@ -79,6 +83,15 @@ private actor MockCredentialService: CredentialService {
 
 @MainActor
 final class HomeAndDatabaseViewModelTests: XCTestCase {
+    private func isolatedDefaults() -> UserDefaults {
+        let suiteName = "HomeViewModelTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            fatalError("Unable to create isolated UserDefaults")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        return defaults
+    }
+
     func testHomeViewModelLoadsAndFilters() async {
         let instance = DiscoveredInstance(
             source: .brew,
@@ -91,18 +104,103 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
         let provider = StaticDiscoveryProvider(source: .brew, instances: [instance])
         let coordinator = DiscoveryCoordinator(providers: [provider])
         let catalog = MockCatalogService(databaseNames: ["postgres", "app_db"])
+        let defaults = isolatedDefaults()
 
-        let vm = HomeViewModel(discoveryCoordinator: coordinator, catalogService: catalog)
+        let vm = HomeViewModel(
+            discoveryCoordinator: coordinator,
+            catalogService: catalog,
+            userDefaults: defaults
+        )
         await vm.loadNow()
 
         XCTAssertEqual(vm.visibleGroups.count, 1)
-        XCTAssertEqual(vm.visibleGroups[0].databases.map(\.name), ["app_db"])
+        XCTAssertEqual(vm.visibleGroups[0].databases.map(\.name), ["postgres", "app_db"])
 
         vm.searchText = "app"
         try? await Task.sleep(for: .milliseconds(300))
 
         XCTAssertEqual(vm.visibleGroups.count, 1)
         XCTAssertEqual(vm.visibleGroups[0].databases.map(\.name), ["app_db"])
+    }
+
+    func testHomeViewModelHideAndShowDatabase() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let provider = StaticDiscoveryProvider(source: .brew, instances: [instance])
+        let coordinator = DiscoveryCoordinator(providers: [provider])
+        let catalog = MockCatalogService(databaseNames: ["postgres", "app_db"])
+        let defaults = isolatedDefaults()
+
+        let vm = HomeViewModel(
+            discoveryCoordinator: coordinator,
+            catalogService: catalog,
+            userDefaults: defaults
+        )
+        await vm.loadNow()
+
+        guard let postgres = vm.visibleGroups.first?.databases.first(where: { $0.name == "postgres" }) else {
+            XCTFail("Expected postgres database")
+            return
+        }
+
+        vm.toggleDatabaseVisibility(postgres)
+        XCTAssertEqual(vm.hiddenDatabaseCount, 1)
+        XCTAssertEqual(vm.visibleGroups[0].databases.map(\.name), ["app_db"])
+
+        vm.showHiddenDatabases = true
+        XCTAssertEqual(vm.visibleGroups[0].databases.map(\.name), ["postgres", "app_db"])
+    }
+
+    func testHomeViewModelPersistsHiddenDatabases() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let provider = StaticDiscoveryProvider(source: .brew, instances: [instance])
+        let coordinator = DiscoveryCoordinator(providers: [provider])
+        let catalog = MockCatalogService(databaseNames: ["postgres", "app_db"])
+
+        let suiteName = "HomeViewModelPersistenceTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Unable to create isolated UserDefaults")
+            return
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let vm = HomeViewModel(
+            discoveryCoordinator: coordinator,
+            catalogService: catalog,
+            userDefaults: defaults
+        )
+        await vm.loadNow()
+
+        guard let postgres = vm.visibleGroups.first?.databases.first(where: { $0.name == "postgres" }) else {
+            XCTFail("Expected postgres database")
+            return
+        }
+        vm.toggleDatabaseVisibility(postgres)
+        XCTAssertEqual(vm.hiddenDatabaseCount, 1)
+
+        let reloadedVM = HomeViewModel(
+            discoveryCoordinator: coordinator,
+            catalogService: catalog,
+            userDefaults: defaults
+        )
+        await reloadedVM.loadNow()
+
+        XCTAssertEqual(reloadedVM.hiddenDatabaseCount, 1)
+        XCTAssertEqual(reloadedVM.visibleGroups[0].databases.map(\.name), ["app_db"])
     }
 
     func testDatabaseViewModelAutoSelectsFirstTableAndFetchesRows() async {

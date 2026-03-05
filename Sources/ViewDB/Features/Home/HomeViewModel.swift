@@ -6,13 +6,20 @@ import Observation
 final class HomeViewModel {
     private let discoveryCoordinator: DiscoveryCoordinator
     private let catalogService: any CatalogService
+    private let userDefaults: UserDefaults
+    private static let hiddenDatabaseIDsKey = "home.hiddenDatabaseIDs"
 
     private(set) var allGroups: [DatabaseGroup] = []
     private(set) var visibleGroups: [DatabaseGroup] = []
+    private(set) var hiddenDatabaseIDs: Set<UUID> = []
 
     var isLoading = false
     var errorMessage: String?
-    var includeSystemDatabases = false
+    var showHiddenDatabases = false {
+        didSet {
+            visibleGroups = applyFilter(allGroups, query: searchText)
+        }
+    }
     var searchText = "" {
         didSet {
             scheduleSearchDebounce()
@@ -22,9 +29,15 @@ final class HomeViewModel {
     private var loadTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
 
-    init(discoveryCoordinator: DiscoveryCoordinator, catalogService: any CatalogService) {
+    init(
+        discoveryCoordinator: DiscoveryCoordinator,
+        catalogService: any CatalogService,
+        userDefaults: UserDefaults = .standard
+    ) {
         self.discoveryCoordinator = discoveryCoordinator
         self.catalogService = catalogService
+        self.userDefaults = userDefaults
+        self.hiddenDatabaseIDs = Self.loadHiddenDatabaseIDs(from: userDefaults, key: Self.hiddenDatabaseIDsKey)
     }
 
     func load() {
@@ -43,9 +56,30 @@ final class HomeViewModel {
         load()
     }
 
-    func toggleIncludeSystemDatabases() {
-        includeSystemDatabases.toggle()
-        load()
+    var hiddenDatabaseCount: Int {
+        allGroups
+            .flatMap(\.databases)
+            .filter { hiddenDatabaseIDs.contains($0.id) }
+            .count
+    }
+
+    func isDatabaseHidden(_ database: DatabaseRef) -> Bool {
+        hiddenDatabaseIDs.contains(database.id)
+    }
+
+    func hiddenDatabaseCount(for instanceID: UUID) -> Int {
+        guard let group = allGroups.first(where: { $0.instance.id == instanceID }) else { return 0 }
+        return group.databases.filter { hiddenDatabaseIDs.contains($0.id) }.count
+    }
+
+    func toggleDatabaseVisibility(_ database: DatabaseRef) {
+        if hiddenDatabaseIDs.contains(database.id) {
+            hiddenDatabaseIDs.remove(database.id)
+        } else {
+            hiddenDatabaseIDs.insert(database.id)
+        }
+        persistHiddenDatabaseIDs()
+        visibleGroups = applyFilter(allGroups, query: searchText)
     }
 
     private func loadImpl() async {
@@ -56,9 +90,9 @@ final class HomeViewModel {
 
         let groups = await withTaskGroup(of: DatabaseGroup.self) { group in
             for instance in instances {
-                group.addTask { [catalogService, includeSystemDatabases] in
+                group.addTask { [catalogService] in
                     do {
-                        let databases = try await catalogService.listDatabases(on: instance, includeSystem: includeSystemDatabases)
+                        let databases = try await catalogService.listDatabases(on: instance, includeSystem: true)
                         return DatabaseGroup(instance: instance, databases: databases)
                     } catch {
                         return DatabaseGroup(
@@ -83,6 +117,7 @@ final class HomeViewModel {
         }
 
         allGroups = groups
+        trimHiddenDatabaseIDs(keeping: groups)
         visibleGroups = applyFilter(groups, query: searchText)
         isLoading = false
     }
@@ -102,20 +137,48 @@ final class HomeViewModel {
 
     private func applyFilter(_ groups: [DatabaseGroup], query: String) -> [DatabaseGroup] {
         let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else {
-            return groups
-        }
+        let isSearchActive = !normalized.isEmpty
 
         return groups.compactMap { group in
-            let filtered = group.databases.filter { database in
-                database.name.localizedCaseInsensitiveContains(normalized)
+            let searchFiltered: [DatabaseRef]
+            if isSearchActive {
+                searchFiltered = group.databases.filter { database in
+                    database.name.localizedCaseInsensitiveContains(normalized)
+                }
+            } else {
+                searchFiltered = group.databases
             }
 
-            if filtered.isEmpty {
+            let visibilityFiltered = searchFiltered.filter { database in
+                showHiddenDatabases || !hiddenDatabaseIDs.contains(database.id)
+            }
+
+            if isSearchActive && visibilityFiltered.isEmpty {
                 return nil
             }
 
-            return DatabaseGroup(instance: group.instance, databases: filtered, warningMessage: group.warningMessage)
+            return DatabaseGroup(
+                instance: group.instance,
+                databases: visibilityFiltered,
+                warningMessage: group.warningMessage
+            )
         }
+    }
+
+    private func trimHiddenDatabaseIDs(keeping groups: [DatabaseGroup]) {
+        let availableDatabaseIDs = Set(groups.flatMap(\.databases).map(\.id))
+        let trimmed = hiddenDatabaseIDs.intersection(availableDatabaseIDs)
+        guard trimmed != hiddenDatabaseIDs else { return }
+        hiddenDatabaseIDs = trimmed
+        persistHiddenDatabaseIDs()
+    }
+
+    private func persistHiddenDatabaseIDs() {
+        userDefaults.set(hiddenDatabaseIDs.map(\.uuidString), forKey: Self.hiddenDatabaseIDsKey)
+    }
+
+    private static func loadHiddenDatabaseIDs(from userDefaults: UserDefaults, key: String) -> Set<UUID> {
+        let rawIDs = userDefaults.array(forKey: key) as? [String] ?? []
+        return Set(rawIDs.compactMap(UUID.init(uuidString:)))
     }
 }

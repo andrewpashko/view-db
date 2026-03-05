@@ -28,7 +28,7 @@ actor PostgresSessionPool {
         let credential = await credentialsStore.credential(for: instance.endpointKey)
         let fallbackUser = instance.defaultUser ?? ProcessInfo.processInfo.environment["USER"] ?? "postgres"
         let username = credential?.username ?? fallbackUser
-        let password = credential?.password
+        let password = credential?.password ?? instance.defaultPassword
 
         do {
             let configuration = makeConfiguration(

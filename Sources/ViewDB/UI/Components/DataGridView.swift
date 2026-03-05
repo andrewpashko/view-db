@@ -4,81 +4,55 @@ struct DataGridView: View {
     let columns: [String]
     let rows: [TableRowItem]
 
+    @State private var hoveredRowID: TableRowItem.ID?
+
     private let columnWidth: CGFloat = 170
-    private let headerTint = Color(nsColor: .windowBackgroundColor).opacity(0.76)
-    private let headerCellTint = Color.white.opacity(0.18)
-    private let rowBackground = Color(nsColor: .textBackgroundColor)
+    private let hoverRowBackground = Color.accentColor.opacity(0.08)
+    private var tableColumns: [GridColumn] {
+        Array(columns.enumerated()).map { index, title in
+            GridColumn(id: index, title: title)
+        }
+    }
 
     var body: some View {
-        ZStack {
-            rowBackground
-
-            ScrollView([.horizontal, .vertical]) {
-                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                    Section {
-                        ForEach(rows) { row in
-                            HStack(spacing: 0) {
-                                ForEach(Array(columns.enumerated()), id: \.offset) { index, _ in
-                                    Text(row.values[safe: index] ?? "")
-                                        .font(.system(.body, design: .monospaced))
-                                        .lineLimit(1)
-                                        .textSelection(.enabled)
-                                        .frame(width: columnWidth, alignment: .leading)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 6)
-                                        .background(Color.clear)
-                                        .overlay(alignment: .trailing) {
-                                            Rectangle()
-                                                .fill(Color.secondary.opacity(0.12))
-                                                .frame(width: 0.5)
-                                        }
-                                }
-                            }
-                            .background(
-                                row.id.isMultiple(of: 2) ? rowBackground : rowBackground.opacity(0.97)
-                            )
-                        }
-                    } header: {
-                        headerRow
-                            .background {
-                                Rectangle()
-                                    .fill(.ultraThinMaterial)
-                                    .overlay(headerTint)
-                            }
-                            .zIndex(2)
-                    }
+        Table(rows) {
+            TableColumnForEach(tableColumns) { column in
+                TableColumn(column.title) { row in
+                    cell(for: row, at: column.id)
                 }
+                .width(columnWidth)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .textSelection(.enabled)
         .overlay {
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(Color.secondary.opacity(0.15), lineWidth: 1)
         }
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
-    private var headerRow: some View {
-        HStack(spacing: 0) {
-            ForEach(Array(columns.enumerated()), id: \.offset) { _, title in
-                Text(title)
-                    .font(.system(.caption, design: .monospaced).weight(.bold))
-                    .lineLimit(1)
-                    .frame(width: columnWidth, alignment: .leading)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 9)
-                    .background(headerCellTint)
-                    .overlay(alignment: .trailing) {
-                        Rectangle()
-                            .fill(Color.secondary.opacity(0.18))
-                            .frame(width: 0.5)
+    private func cell(for row: TableRowItem, at index: Int) -> some View {
+        Text(row.values[safe: index] ?? "")
+            .font(.system(.callout, design: .monospaced))
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(hoveredRowID == row.id ? hoverRowBackground : Color.clear)
+            .contentShape(Rectangle())
+            .onHover { isHovered in
+                if isHovered {
+                    if hoveredRowID != row.id {
+                        hoveredRowID = row.id
                     }
+                } else if hoveredRowID == row.id {
+                    hoveredRowID = nil
+                }
             }
-        }
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color.secondary.opacity(0.2))
-                .frame(height: 1)
-        }
-        .compositingGroup()
+    }
+
+    private struct GridColumn: Identifiable {
+        let id: Int
+        let title: String
     }
 }
