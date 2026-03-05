@@ -38,6 +38,7 @@ struct RowPageRequest: Sendable {
 
 struct RowPage: Sendable {
     let columns: [String]
+    let columnTypeNames: [String]
     let rows: [[String]]
     let limit: Int
     let offset: Int
@@ -47,8 +48,33 @@ struct RowPage: Sendable {
     let nextCursor: String?
     let previousCursor: String?
 
+    init(
+        columns: [String],
+        columnTypeNames: [String] = [],
+        rows: [[String]],
+        limit: Int,
+        offset: Int,
+        hasNext: Bool,
+        strategy: RowPagingStrategy,
+        orderedByColumn: String?,
+        nextCursor: String?,
+        previousCursor: String?
+    ) {
+        self.columns = columns
+        self.columnTypeNames = columnTypeNames
+        self.rows = rows
+        self.limit = limit
+        self.offset = offset
+        self.hasNext = hasNext
+        self.strategy = strategy
+        self.orderedByColumn = orderedByColumn
+        self.nextCursor = nextCursor
+        self.previousCursor = previousCursor
+    }
+
     static let empty = RowPage(
         columns: [],
+        columnTypeNames: [],
         rows: [],
         limit: 0,
         offset: 0,
@@ -84,6 +110,7 @@ struct TableRowItem: Identifiable, Hashable {
 
 struct RowPagePreview: Sendable {
     let columns: [String]
+    let columnTypeNames: [String]
     let rows: [TableRowItem]
     let limit: Int
     let offset: Int
@@ -93,8 +120,33 @@ struct RowPagePreview: Sendable {
     let nextCursor: String?
     let previousCursor: String?
 
+    init(
+        columns: [String],
+        columnTypeNames: [String] = [],
+        rows: [TableRowItem],
+        limit: Int,
+        offset: Int,
+        hasNext: Bool,
+        strategy: RowPagingStrategy,
+        orderedByColumn: String?,
+        nextCursor: String?,
+        previousCursor: String?
+    ) {
+        self.columns = columns
+        self.columnTypeNames = columnTypeNames
+        self.rows = rows
+        self.limit = limit
+        self.offset = offset
+        self.hasNext = hasNext
+        self.strategy = strategy
+        self.orderedByColumn = orderedByColumn
+        self.nextCursor = nextCursor
+        self.previousCursor = previousCursor
+    }
+
     static let empty = RowPagePreview(
         columns: [],
+        columnTypeNames: [],
         rows: [],
         limit: 0,
         offset: 0,

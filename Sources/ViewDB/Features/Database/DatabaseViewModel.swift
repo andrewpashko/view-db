@@ -426,6 +426,7 @@ final class DatabaseViewModel {
     private static func makeRowPageMetadata(from preview: RowPagePreview) -> RowPage {
         RowPage(
             columns: preview.columns,
+            columnTypeNames: preview.columnTypeNames,
             rows: [],
             limit: preview.limit,
             offset: preview.offset,

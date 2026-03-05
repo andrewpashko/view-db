@@ -341,6 +341,58 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
         XCTAssertEqual(lastFetchedTable, "users")
     }
 
+    func testDatabaseViewModelPropagatesColumnTypeNamesFromPreview() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let database = DatabaseRef(instanceID: instance.id, name: "app_db")
+        let table = TableRef(databaseID: database.id, schema: "public", name: "events")
+        let previewPage = RowPagePreview(
+            columns: ["id", "payload"],
+            columnTypeNames: ["int8", "jsonb"],
+            rows: [
+                TableRowItem(
+                    id: 0,
+                    identity: .offset(0),
+                    values: [
+                        TableCellValue(previewText: "1", isTruncated: false),
+                        TableCellValue(previewText: #"{"name":"demo"}"#, isTruncated: false),
+                    ]
+                ),
+            ],
+            limit: 100,
+            offset: 0,
+            hasNext: false,
+            strategy: .offset,
+            orderedByColumn: nil,
+            nextCursor: nil,
+            previousCursor: nil
+        )
+
+        let lookup = MockInstanceLookupService(instance: instance)
+        let catalog = MockCatalogService(databaseNames: [database.name], tables: [table])
+        let query = MockQueryService(initialPreviewPage: previewPage)
+        let credentials = MockCredentialService()
+
+        let vm = DatabaseViewModel(
+            database: database,
+            instanceLookup: lookup,
+            catalogService: catalog,
+            queryService: query,
+            credentialService: credentials
+        )
+
+        await vm.loadNow()
+        try? await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertEqual(vm.rowPage.columnTypeNames, ["int8", "jsonb"])
+    }
+
     func testDatabaseViewModelUsesCursorForKeysetNextAndPrevious() async {
         let instance = DiscoveredInstance(
             source: .brew,

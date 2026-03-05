@@ -56,6 +56,18 @@ final class PostgresRepositoryPagingTests: XCTestCase {
         XCTAssertNil(selection.orderColumn)
     }
 
+    func testMakeColumnTypeNamesPreservesColumnOrder() {
+        let types = PostgresRepository.makeColumnTypeNames(
+            columns: [
+                (name: "id", udtName: "INT8"),
+                (name: "payload", udtName: "JSONB"),
+                (name: "title", udtName: "text"),
+            ]
+        )
+
+        XCTAssertEqual(types, ["int8", "jsonb", "text"])
+    }
+
     func testMakePreviewCellValueTruncatesLongPayloads() {
         let value = String(repeating: "a", count: 300)
         let preview = PostgresRepository.makePreviewCellValue(value: value, maxChars: 256)

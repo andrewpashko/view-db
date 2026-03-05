@@ -40,6 +40,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
     private struct TablePagingPlan: Sendable {
         let strategy: RowPagingStrategy
         let columns: [String]
+        let columnTypeNames: [String]
         let orderColumn: String?
         let orderType: KeysetValueType?
     }
@@ -213,6 +214,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
 
             let output = RowPage(
                 columns: pagingPlan.columns,
+                columnTypeNames: pagingPlan.columnTypeNames,
                 rows: collected.rows,
                 limit: pageLimit,
                 offset: logicalOffset,
@@ -322,6 +324,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
 
             let output = RowPagePreview(
                 columns: pagingPlan.columns,
+                columnTypeNames: pagingPlan.columnTypeNames,
                 rows: rows,
                 limit: pageLimit,
                 offset: logicalOffset,
@@ -438,6 +441,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
 
             return RowPage(
                 columns: collected.columns,
+                columnTypeNames: [],
                 rows: rows,
                 limit: pageLimit,
                 offset: 0,
@@ -474,6 +478,9 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         let metadata = try await resolveTableMetadata(database: database, table: table, instance: instance, key: key)
         let columnLookup = Dictionary(uniqueKeysWithValues: metadata.columns.map { ($0.name, $0) })
         let columns = metadata.columns.map(\.name)
+        let columnTypeNames = Self.makeColumnTypeNames(
+            columns: metadata.columns.map { (name: $0.name, udtName: $0.udtName) }
+        )
 
         let selection = Self.selectPagingOrder(
             columns: metadata.columns.map { (name: $0.name, udtName: $0.udtName) },
@@ -487,6 +494,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
             let plan = TablePagingPlan(
                 strategy: .keysetID,
                 columns: columns,
+                columnTypeNames: columnTypeNames,
                 orderColumn: "id",
                 orderType: valueType
             )
@@ -501,6 +509,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
             let plan = TablePagingPlan(
                 strategy: .keysetPrimaryKey,
                 columns: columns,
+                columnTypeNames: columnTypeNames,
                 orderColumn: primaryKey,
                 orderType: valueType
             )
@@ -512,6 +521,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
             let plan = TablePagingPlan(
                 strategy: .keysetCTID,
                 columns: columns,
+                columnTypeNames: columnTypeNames,
                 orderColumn: "ctid",
                 orderType: .ctid
             )
@@ -522,6 +532,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         let plan = TablePagingPlan(
             strategy: .offset,
             columns: columns,
+            columnTypeNames: columnTypeNames,
             orderColumn: nil,
             orderType: nil
         )
@@ -893,6 +904,10 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         }
 
         return (.offset, nil)
+    }
+
+    static func makeColumnTypeNames(columns: [(name: String, udtName: String)]) -> [String] {
+        columns.map { $0.udtName.lowercased() }
     }
 
     private static func keysetType(for udtName: String) -> KeysetValueType? {

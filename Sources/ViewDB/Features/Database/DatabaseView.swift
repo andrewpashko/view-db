@@ -205,6 +205,7 @@ struct DatabaseView: View {
             } else {
                 TableGridSection(
                     columns: viewModel.rowPage.columns,
+                    columnTypeNames: viewModel.rowPage.columnTypeNames,
                     rows: viewModel.tableRows,
                     onRequestFullValue: { rowIdentity, columnName in
                         await viewModel.fetchFullCellValue(rowIdentity: rowIdentity, columnName: columnName)
@@ -344,12 +345,14 @@ struct DatabaseView: View {
 
 private struct TableGridSection: View {
     let columns: [String]
+    let columnTypeNames: [String]
     let rows: [TableRowItem]
     let onRequestFullValue: DataGridView.FullValueProvider
 
     var body: some View {
         DataGridView(
             columns: columns,
+            columnTypeNames: columnTypeNames,
             rows: rows,
             onRequestFullValue: onRequestFullValue
         )

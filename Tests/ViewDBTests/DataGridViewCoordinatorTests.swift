@@ -4,6 +4,83 @@ import XCTest
 
 @MainActor
 final class DataGridViewCoordinatorTests: XCTestCase {
+    func testIsValueVisuallyClippedWhenColumnIsTooNarrow() {
+        XCTAssertTrue(
+            DataGridView.Coordinator.isValueVisuallyClipped(
+                "abcdefghijklmnopqrstuvwxyz",
+                columnWidth: 84
+            )
+        )
+    }
+
+    func testIsValueVisuallyClippedForMultilineText() {
+        XCTAssertTrue(
+            DataGridView.Coordinator.isValueVisuallyClipped(
+                "line1\nline2",
+                columnWidth: 300
+            )
+        )
+    }
+
+    func testNextPopoverIntentTogglesSameCell() {
+        let intent = DataGridView.Coordinator.nextPopoverIntent(
+            currentCell: (row: 2, column: 1),
+            isPopoverShown: true,
+            clickedCell: (row: 2, column: 1),
+            shouldOpen: true
+        )
+
+        XCTAssertEqual(intent, .close)
+    }
+
+    func testNextPopoverIntentSwitchesToDifferentCell() {
+        let intent = DataGridView.Coordinator.nextPopoverIntent(
+            currentCell: (row: 2, column: 1),
+            isPopoverShown: true,
+            clickedCell: (row: 3, column: 1),
+            shouldOpen: true
+        )
+
+        XCTAssertEqual(intent, .open(row: 3, column: 1))
+    }
+
+    func testFormatPopoverValuePrettyPrintsJSONColumns() {
+        let formatted = DataGridView.Coordinator.formatPopoverValue(
+            #"{"z":1,"a":{"k":"v"}}"#,
+            columnTypeName: "jsonb"
+        )
+
+        XCTAssertTrue(formatted.contains("\n"))
+        XCTAssertTrue(formatted.contains("\"a\""))
+    }
+
+    func testFormatPopoverValueLeavesInvalidJSONUntouched() {
+        let source = "{bad json"
+        let formatted = DataGridView.Coordinator.formatPopoverValue(
+            source,
+            columnTypeName: "json"
+        )
+
+        XCTAssertEqual(formatted, source)
+    }
+
+    func testPopoverHeightExpandsWithMoreLines() {
+        let short = DataGridView.Coordinator.popoverHeight(for: "one")
+        let longer = DataGridView.Coordinator.popoverHeight(for: "one\ntwo\nthree\nfour\nfive")
+
+        XCTAssertGreaterThan(longer, short)
+    }
+
+    func testPopoverHeightIsClampedToBounds() {
+        let tiny = DataGridView.Coordinator.popoverHeight(for: "")
+        let huge = DataGridView.Coordinator.popoverHeight(
+            for: String(repeating: "x\n", count: 1000)
+        )
+
+        XCTAssertEqual(tiny, 72)
+        XCTAssertEqual(huge, 540)
+    }
+
     func testCoordinatorSkipsReloadWhenPayloadIsUnchanged() {
         let coordinator = DataGridView.Coordinator()
         let tableView = ReloadTrackingTableView()
