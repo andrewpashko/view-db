@@ -34,6 +34,7 @@ final class DatabaseViewModel {
     private(set) var tableRows: [TableRowItem] = []
     private(set) var sqlRows: [TableRowItem] = []
     private(set) var totalRowCount: Int?
+    private(set) var activeSort: TableSort?
 
     private(set) var isLoadingTables = false
     private(set) var isLoadingRows = false
@@ -110,11 +111,13 @@ final class DatabaseViewModel {
     func selectTable(_ table: TableRef) {
         guard selectedTable != table else { return }
         selectedTable = table
+        activeSort = nil
         fetchRows(
             request: RowPageRequest(
                 limit: rowsPerPage,
                 direction: .initial,
-                offset: 0
+                offset: 0,
+                sort: activeSort
             ),
             refreshCount: true
         )
@@ -131,7 +134,8 @@ final class DatabaseViewModel {
                     limit: rowsPerPage,
                     direction: .next,
                     offset: nextOffset,
-                    cursor: cursor
+                    cursor: cursor,
+                    sort: activeSort
                 )
             )
             return
@@ -141,7 +145,8 @@ final class DatabaseViewModel {
             request: RowPageRequest(
                 limit: rowsPerPage,
                 direction: .next,
-                offset: nextOffset
+                offset: nextOffset,
+                sort: activeSort
             )
         )
     }
@@ -155,7 +160,8 @@ final class DatabaseViewModel {
                     limit: rowsPerPage,
                     direction: .previous,
                     offset: newOffset,
-                    cursor: cursor
+                    cursor: cursor,
+                    sort: activeSort
                 )
             )
             return
@@ -165,7 +171,8 @@ final class DatabaseViewModel {
             request: RowPageRequest(
                 limit: rowsPerPage,
                 direction: .previous,
-                offset: newOffset
+                offset: newOffset,
+                sort: activeSort
             )
         )
     }
@@ -178,9 +185,34 @@ final class DatabaseViewModel {
             request: RowPageRequest(
                 limit: normalized,
                 direction: .initial,
-                offset: 0
+                offset: 0,
+                sort: activeSort
             ),
             refreshCount: true
+        )
+    }
+
+    func toggleSort(column: String) {
+        let nextSort: TableSort?
+        if let current = activeSort, current.column == column {
+            switch current.direction {
+            case .ascending:
+                nextSort = TableSort(column: column, direction: .descending)
+            case .descending:
+                nextSort = nil
+            }
+        } else {
+            nextSort = TableSort(column: column, direction: .ascending)
+        }
+
+        activeSort = nextSort
+        fetchRows(
+            request: RowPageRequest(
+                limit: rowsPerPage,
+                direction: .initial,
+                offset: 0,
+                sort: activeSort
+            )
         )
     }
 
@@ -269,17 +301,20 @@ final class DatabaseViewModel {
                     request: RowPageRequest(
                         limit: rowsPerPage,
                         direction: .initial,
-                        offset: rowPage.offset
+                        offset: rowPage.offset,
+                        sort: activeSort
                     ),
                     refreshCount: true
                 )
             } else if let first = tables.first {
                 selectedTable = first
+                activeSort = nil
                 fetchRows(
                     request: RowPageRequest(
                         limit: rowsPerPage,
                         direction: .initial,
-                        offset: 0
+                        offset: 0,
+                        sort: activeSort
                     ),
                     refreshCount: true
                 )
@@ -287,6 +322,7 @@ final class DatabaseViewModel {
                 rowPage = .empty
                 totalRowCount = nil
                 isLoadingCount = false
+                activeSort = nil
             }
         } catch {
             handle(error: error, instance: resolvedInstance, forSQL: false)
@@ -331,6 +367,7 @@ final class DatabaseViewModel {
             )
             if Task.isCancelled { return }
             rowPage = Self.makeRowPageMetadata(from: previewPage)
+            activeSort = previewPage.sort ?? request.sort
             tableRows = previewPage.rows
             if rowsPerPage != previewPage.limit {
                 rowsPerPage = min(previewPage.limit, maxRowsPerPage)
@@ -432,7 +469,7 @@ final class DatabaseViewModel {
             offset: preview.offset,
             hasNext: preview.hasNext,
             strategy: preview.strategy,
-            orderedByColumn: preview.orderedByColumn,
+            sort: preview.sort,
             nextCursor: preview.nextCursor,
             previousCursor: preview.previousCursor
         )
@@ -445,9 +482,34 @@ final class DatabaseViewModel {
             }
             return TableRowItem(
                 id: page.offset + offset,
-                identity: .offset(page.offset + offset),
+                identity: .offset(page.offset + offset, sort: page.sort),
                 values: cellValues
             )
         }
+    }
+
+    var sortableColumns: Set<String> {
+        Set(
+            zip(rowPage.columns, rowPage.columnTypeNames)
+                .compactMap { column, type in
+                    Self.isSortableColumnType(type) ? column : nil
+                }
+        )
+    }
+
+    private static func isSortableColumnType(_ typeName: String) -> Bool {
+        let normalized = typeName.lowercased()
+        if normalized.hasPrefix("_") {
+            return false
+        }
+
+        let sortableTypes: Set<String> = [
+            "bool",
+            "int2", "int4", "int8", "float4", "float8", "numeric", "oid",
+            "text", "varchar", "bpchar", "name",
+            "uuid",
+            "date", "time", "timetz", "timestamp", "timestamptz",
+        ]
+        return sortableTypes.contains(normalized)
     }
 }

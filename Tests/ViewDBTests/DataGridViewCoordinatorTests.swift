@@ -96,10 +96,24 @@ final class DataGridViewCoordinatorTests: XCTestCase {
             ),
         ]
 
-        coordinator.update(columns: ["id"], rows: rows, onRequestFullValue: nil)
+        coordinator.update(
+            columns: ["id"],
+            rows: rows,
+            activeSort: nil,
+            sortableColumns: [],
+            onToggleSort: nil,
+            onRequestFullValue: nil
+        )
         XCTAssertEqual(tableView.reloadDataCallCount, 1)
 
-        coordinator.update(columns: ["id"], rows: rows, onRequestFullValue: nil)
+        coordinator.update(
+            columns: ["id"],
+            rows: rows,
+            activeSort: nil,
+            sortableColumns: [],
+            onToggleSort: nil,
+            onRequestFullValue: nil
+        )
         XCTAssertEqual(tableView.reloadDataCallCount, 1)
     }
 
@@ -125,10 +139,24 @@ final class DataGridViewCoordinatorTests: XCTestCase {
             ),
         ]
 
-        coordinator.update(columns: ["id"], rows: initialRows, onRequestFullValue: nil)
+        coordinator.update(
+            columns: ["id"],
+            rows: initialRows,
+            activeSort: nil,
+            sortableColumns: [],
+            onToggleSort: nil,
+            onRequestFullValue: nil
+        )
         XCTAssertEqual(tableView.reloadDataCallCount, 1)
 
-        coordinator.update(columns: ["id"], rows: updatedRows, onRequestFullValue: nil)
+        coordinator.update(
+            columns: ["id"],
+            rows: updatedRows,
+            activeSort: nil,
+            sortableColumns: [],
+            onToggleSort: nil,
+            onRequestFullValue: nil
+        )
         XCTAssertEqual(tableView.reloadDataCallCount, 2)
     }
 }

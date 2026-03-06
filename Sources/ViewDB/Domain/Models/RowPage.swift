@@ -22,17 +22,29 @@ enum RowPagingStrategy: String, Sendable {
     }
 }
 
+enum SortDirection: String, Hashable, Sendable {
+    case ascending
+    case descending
+}
+
+struct TableSort: Hashable, Sendable {
+    let column: String
+    let direction: SortDirection
+}
+
 struct RowPageRequest: Sendable {
     let limit: Int
     let direction: RowPageDirection
     let offset: Int
     let cursor: String?
+    let sort: TableSort?
 
-    init(limit: Int, direction: RowPageDirection, offset: Int = 0, cursor: String? = nil) {
+    init(limit: Int, direction: RowPageDirection, offset: Int = 0, cursor: String? = nil, sort: TableSort? = nil) {
         self.limit = limit
         self.direction = direction
         self.offset = max(0, offset)
         self.cursor = cursor
+        self.sort = sort
     }
 }
 
@@ -44,7 +56,7 @@ struct RowPage: Sendable {
     let offset: Int
     let hasNext: Bool
     let strategy: RowPagingStrategy
-    let orderedByColumn: String?
+    let sort: TableSort?
     let nextCursor: String?
     let previousCursor: String?
 
@@ -56,7 +68,7 @@ struct RowPage: Sendable {
         offset: Int,
         hasNext: Bool,
         strategy: RowPagingStrategy,
-        orderedByColumn: String?,
+        sort: TableSort?,
         nextCursor: String?,
         previousCursor: String?
     ) {
@@ -67,7 +79,7 @@ struct RowPage: Sendable {
         self.offset = offset
         self.hasNext = hasNext
         self.strategy = strategy
-        self.orderedByColumn = orderedByColumn
+        self.sort = sort
         self.nextCursor = nextCursor
         self.previousCursor = previousCursor
     }
@@ -80,7 +92,7 @@ struct RowPage: Sendable {
         offset: 0,
         hasNext: false,
         strategy: .offset,
-        orderedByColumn: nil,
+        sort: nil,
         nextCursor: nil,
         previousCursor: nil
     )
@@ -92,7 +104,7 @@ enum RowIdentityValueType: String, Hashable, Sendable {
 }
 
 enum RowIdentity: Hashable, Sendable {
-    case offset(Int)
+    case offset(Int, sort: TableSort? = nil)
     case columnValue(column: String, value: String, valueType: RowIdentityValueType)
     case ctid(String)
 }
@@ -116,7 +128,7 @@ struct RowPagePreview: Sendable {
     let offset: Int
     let hasNext: Bool
     let strategy: RowPagingStrategy
-    let orderedByColumn: String?
+    let sort: TableSort?
     let nextCursor: String?
     let previousCursor: String?
 
@@ -128,7 +140,7 @@ struct RowPagePreview: Sendable {
         offset: Int,
         hasNext: Bool,
         strategy: RowPagingStrategy,
-        orderedByColumn: String?,
+        sort: TableSort?,
         nextCursor: String?,
         previousCursor: String?
     ) {
@@ -139,7 +151,7 @@ struct RowPagePreview: Sendable {
         self.offset = offset
         self.hasNext = hasNext
         self.strategy = strategy
-        self.orderedByColumn = orderedByColumn
+        self.sort = sort
         self.nextCursor = nextCursor
         self.previousCursor = previousCursor
     }
@@ -152,7 +164,7 @@ struct RowPagePreview: Sendable {
         offset: 0,
         hasNext: false,
         strategy: .offset,
-        orderedByColumn: nil,
+        sort: nil,
         nextCursor: nil,
         previousCursor: nil
     )

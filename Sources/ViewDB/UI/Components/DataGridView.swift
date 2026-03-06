@@ -20,17 +20,26 @@ struct DataGridView: NSViewRepresentable {
     let columns: [String]
     let columnTypeNames: [String]
     let rows: [TableRowItem]
+    let activeSort: TableSort?
+    let sortableColumns: Set<String>
+    let onToggleSort: ((String) -> Void)?
     let onRequestFullValue: FullValueProvider?
 
     init(
         columns: [String],
         columnTypeNames: [String] = [],
         rows: [TableRowItem],
+        activeSort: TableSort? = nil,
+        sortableColumns: Set<String> = [],
+        onToggleSort: ((String) -> Void)? = nil,
         onRequestFullValue: FullValueProvider? = nil
     ) {
         self.columns = columns
         self.columnTypeNames = columnTypeNames
         self.rows = rows
+        self.activeSort = activeSort
+        self.sortableColumns = sortableColumns
+        self.onToggleSort = onToggleSort
         self.onRequestFullValue = onRequestFullValue
     }
 
@@ -78,6 +87,9 @@ struct DataGridView: NSViewRepresentable {
             columns: columns,
             rows: rows,
             columnTypeNames: columnTypeNames,
+            activeSort: activeSort,
+            sortableColumns: sortableColumns,
+            onToggleSort: onToggleSort,
             onRequestFullValue: onRequestFullValue
         )
         return scrollView
@@ -89,6 +101,9 @@ struct DataGridView: NSViewRepresentable {
             columns: columns,
             rows: rows,
             columnTypeNames: columnTypeNames,
+            activeSort: activeSort,
+            sortableColumns: sortableColumns,
+            onToggleSort: onToggleSort,
             onRequestFullValue: onRequestFullValue
         )
     }
@@ -197,7 +212,10 @@ extension DataGridView {
         private var columns: [String] = []
         private var rows: [TableRowItem] = []
         private var columnTypeNames: [String] = []
+        private var activeSort: TableSort?
+        private var sortableColumns: Set<String> = []
         private var columnIndexByIdentifier: [NSUserInterfaceItemIdentifier: Int] = [:]
+        private var onToggleSort: ((String) -> Void)?
         private var onRequestFullValue: FullValueProvider?
         private var focusedCell: (row: Int, column: Int)?
 
@@ -216,33 +234,53 @@ extension DataGridView {
             columns: [String],
             rows: [TableRowItem],
             columnTypeNames: [String] = [],
+            activeSort: TableSort?,
+            sortableColumns: Set<String>,
+            onToggleSort: ((String) -> Void)?,
             onRequestFullValue: FullValueProvider?
         ) {
             let start = CFAbsoluteTimeGetCurrent()
             self.onRequestFullValue = onRequestFullValue
+            self.onToggleSort = onToggleSort
             let columnsChanged = self.columns != columns
             let rowsChanged = self.rows != rows
             let typesChanged = self.columnTypeNames != columnTypeNames
+            let sortChanged = self.activeSort != activeSort
+            let sortableChanged = self.sortableColumns != sortableColumns
             var updateReason = "none"
 
             if columnsChanged {
                 self.columns = columns
                 self.rows = rows
                 self.columnTypeNames = columnTypeNames
+                self.activeSort = activeSort
+                self.sortableColumns = sortableColumns
                 rebuildColumns()
                 updateReason = "columns"
             } else if rowsChanged {
                 self.rows = rows
                 self.columnTypeNames = columnTypeNames
+                self.activeSort = activeSort
+                self.sortableColumns = sortableColumns
                 tableView?.reloadData()
                 updateReason = "rows"
             } else if typesChanged {
                 self.columnTypeNames = columnTypeNames
+                self.activeSort = activeSort
+                self.sortableColumns = sortableColumns
                 updateReason = "types"
+            } else if sortChanged || sortableChanged {
+                self.activeSort = activeSort
+                self.sortableColumns = sortableColumns
+                updateReason = sortChanged ? "sort" : "sortable"
             }
 
             if columnsChanged || rowsChanged || typesChanged {
                 closePopover()
+            }
+
+            if columnsChanged || sortChanged || sortableChanged {
+                updateSortIndicators()
             }
 
             if let focusedCell {
@@ -308,6 +346,15 @@ extension DataGridView {
 
             let column = focusedCell?.column ?? 0
             focusedCell = (row: tableView.selectedRow, column: max(0, min(column, max(0, columns.count - 1))))
+        }
+
+        func tableView(_ tableView: NSTableView, didClick tableColumn: NSTableColumn) {
+            guard let index = columnIndex(for: tableColumn),
+                  let columnName = columns[safe: index],
+                  sortableColumns.contains(columnName) else {
+                return
+            }
+            onToggleSort?(columnName)
         }
 
         func focusCell(row: Int, column: Int) {
@@ -469,7 +516,52 @@ extension DataGridView {
                 columnIndexByIdentifier[identifier] = index
             }
 
+            updateSortIndicators()
             tableView.reloadData()
+            refreshHeaderRendering()
+        }
+
+        private func refreshHeaderRendering() {
+            guard let headerView = tableView?.headerView else { return }
+            headerView.needsDisplay = true
+            DispatchQueue.main.async { [weak headerView] in
+                headerView?.needsDisplay = true
+                headerView?.displayIfNeeded()
+            }
+        }
+
+        private func updateSortIndicators() {
+            guard let tableView else { return }
+
+            let ascending = NSImage(
+                systemSymbolName: "arrowtriangle.up.fill",
+                accessibilityDescription: "Sorted ascending"
+            )
+            let descending = NSImage(
+                systemSymbolName: "arrowtriangle.down.fill",
+                accessibilityDescription: "Sorted descending"
+            )
+
+            for tableColumn in tableView.tableColumns {
+                guard let index = columnIndex(for: tableColumn),
+                      let columnName = columns[safe: index] else {
+                    continue
+                }
+
+                let image: NSImage?
+                if let activeSort, activeSort.column == columnName {
+                    image = activeSort.direction == .ascending ? ascending : descending
+                } else {
+                    image = nil
+                }
+                tableView.setIndicatorImage(image, in: tableColumn)
+
+                if sortableColumns.contains(columnName) {
+                    tableColumn.headerToolTip = "Click to sort"
+                } else {
+                    tableColumn.headerToolTip = nil
+                }
+            }
         }
 
         private func columnIndex(for tableColumn: NSTableColumn) -> Int? {
@@ -631,16 +723,61 @@ extension DataGridView {
 private final class PaddedTableHeaderCell: NSTableHeaderCell {
     override init(textCell string: String) {
         super.init(textCell: string)
-        font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
-        alignment = .left
-        lineBreakMode = .byTruncatingTail
+        configure()
     }
 
     required init(coder: NSCoder) {
         super.init(coder: coder)
+        configure()
     }
 
     override func drawingRect(forBounds rect: NSRect) -> NSRect {
-        rect.insetBy(dx: DataGridMetrics.cellHorizontalPadding, dy: 0)
+        rect.insetBy(dx: DataGridMetrics.cellHorizontalPadding, dy: 0).integral
+    }
+
+    override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
+        let titleRect = drawingRect(forBounds: cellFrame)
+        guard titleRect.width > 0, titleRect.height > 0, !stringValue.isEmpty else { return }
+
+        let text = stringValue as NSString
+        let measuredRect = text.boundingRect(
+            with: NSSize(width: titleRect.width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
+            attributes: textAttributes
+        )
+        let drawRect = NSRect(
+            x: titleRect.minX,
+            y: floor(titleRect.midY - (measuredRect.height / 2)),
+            width: titleRect.width,
+            height: ceil(measuredRect.height)
+        ).integral
+
+        text.draw(
+            with: drawRect,
+            options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine],
+            attributes: textAttributes
+        )
+    }
+
+    private func configure() {
+        font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
+        alignment = .left
+        wraps = false
+        usesSingleLineMode = true
+        isScrollable = true
+        truncatesLastVisibleLine = true
+        lineBreakMode = .byTruncatingTail
+    }
+
+    private var textAttributes: [NSAttributedString.Key: Any] {
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = alignment
+        paragraphStyle.lineBreakMode = .byTruncatingTail
+
+        return [
+            .font: font ?? .monospacedSystemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraphStyle,
+        ]
     }
 }

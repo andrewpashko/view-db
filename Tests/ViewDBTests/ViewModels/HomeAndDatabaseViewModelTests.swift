@@ -81,7 +81,7 @@ private actor MockQueryService: QueryService {
             offset: 0,
             hasNext: false,
             strategy: .offset,
-            orderedByColumn: nil,
+            sort: nil,
             nextCursor: nil,
             previousCursor: nil
         ),
@@ -107,7 +107,7 @@ private actor MockQueryService: QueryService {
             offset: preview.offset,
             hasNext: preview.hasNext,
             strategy: preview.strategy,
-            orderedByColumn: preview.orderedByColumn,
+            sort: preview.sort,
             nextCursor: preview.nextCursor,
             previousCursor: preview.previousCursor
         )
@@ -150,7 +150,7 @@ private actor MockQueryService: QueryService {
             offset: 0,
             hasNext: false,
             strategy: .offset,
-            orderedByColumn: nil,
+            sort: nil,
             nextCursor: nil,
             previousCursor: nil
         )
@@ -369,7 +369,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             offset: 0,
             hasNext: false,
             strategy: .offset,
-            orderedByColumn: nil,
+            sort: nil,
             nextCursor: nil,
             previousCursor: nil
         )
@@ -430,7 +430,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             offset: 0,
             hasNext: true,
             strategy: .keysetID,
-            orderedByColumn: "id",
+            sort: nil,
             nextCursor: "2",
             previousCursor: "1"
         )
@@ -458,7 +458,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             offset: 2,
             hasNext: true,
             strategy: .keysetID,
-            orderedByColumn: "id",
+            sort: nil,
             nextCursor: "4",
             previousCursor: "3"
         )
@@ -532,7 +532,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             offset: 0,
             hasNext: false,
             strategy: .offset,
-            orderedByColumn: nil,
+            sort: nil,
             nextCursor: nil,
             previousCursor: nil
         )
@@ -597,5 +597,77 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
 
         await loadTask.value
         XCTAssertFalse(vm.isLoadingTables)
+    }
+
+    func testDatabaseViewModelSortToggleCyclesAscendingDescendingClear() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let database = DatabaseRef(instanceID: instance.id, name: "app_db")
+        let table = TableRef(databaseID: database.id, schema: "public", name: "events")
+        let previewPage = RowPagePreview(
+            columns: ["id", "name"],
+            columnTypeNames: ["int8", "text"],
+            rows: [
+                TableRowItem(
+                    id: 0,
+                    identity: .offset(0),
+                    values: [
+                        TableCellValue(previewText: "1", isTruncated: false),
+                        TableCellValue(previewText: "a", isTruncated: false),
+                    ]
+                ),
+            ],
+            limit: 100,
+            offset: 0,
+            hasNext: false,
+            strategy: .offset,
+            sort: nil,
+            nextCursor: nil,
+            previousCursor: nil
+        )
+
+        let lookup = MockInstanceLookupService(instance: instance)
+        let catalog = MockCatalogService(databaseNames: [database.name], tables: [table])
+        let query = MockQueryService(initialPreviewPage: previewPage)
+        let credentials = MockCredentialService()
+
+        let vm = DatabaseViewModel(
+            database: database,
+            instanceLookup: lookup,
+            catalogService: catalog,
+            queryService: query,
+            credentialService: credentials
+        )
+
+        await vm.loadNow()
+        try? await Task.sleep(for: .milliseconds(120))
+
+        vm.toggleSort(column: "id")
+        try? await Task.sleep(for: .milliseconds(120))
+        vm.toggleSort(column: "id")
+        try? await Task.sleep(for: .milliseconds(120))
+        vm.toggleSort(column: "id")
+        try? await Task.sleep(for: .milliseconds(120))
+
+        let requests = await query.requests()
+        XCTAssertGreaterThanOrEqual(requests.count, 4)
+
+        XCTAssertEqual(requests[1].direction, .initial)
+        XCTAssertEqual(requests[1].offset, 0)
+        XCTAssertEqual(requests[1].sort, TableSort(column: "id", direction: .ascending))
+
+        XCTAssertEqual(requests[2].direction, .initial)
+        XCTAssertEqual(requests[2].offset, 0)
+        XCTAssertEqual(requests[2].sort, TableSort(column: "id", direction: .descending))
+
+        XCTAssertEqual(requests[3].direction, .initial)
+        XCTAssertEqual(requests[3].offset, 0)
+        XCTAssertNil(requests[3].sort)
     }
 }

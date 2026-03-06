@@ -207,6 +207,11 @@ struct DatabaseView: View {
                     columns: viewModel.rowPage.columns,
                     columnTypeNames: viewModel.rowPage.columnTypeNames,
                     rows: viewModel.tableRows,
+                    activeSort: viewModel.activeSort,
+                    sortableColumns: viewModel.sortableColumns,
+                    onToggleSort: { columnName in
+                        viewModel.toggleSort(column: columnName)
+                    },
                     onRequestFullValue: { rowIdentity, columnName in
                         await viewModel.fetchFullCellValue(rowIdentity: rowIdentity, columnName: columnName)
                     }
@@ -347,6 +352,9 @@ private struct TableGridSection: View {
     let columns: [String]
     let columnTypeNames: [String]
     let rows: [TableRowItem]
+    let activeSort: TableSort?
+    let sortableColumns: Set<String>
+    let onToggleSort: (String) -> Void
     let onRequestFullValue: DataGridView.FullValueProvider
 
     var body: some View {
@@ -354,6 +362,9 @@ private struct TableGridSection: View {
             columns: columns,
             columnTypeNames: columnTypeNames,
             rows: rows,
+            activeSort: activeSort,
+            sortableColumns: sortableColumns,
+            onToggleSort: onToggleSort,
             onRequestFullValue: onRequestFullValue
         )
         .transaction { transaction in

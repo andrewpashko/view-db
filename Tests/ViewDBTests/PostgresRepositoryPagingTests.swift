@@ -134,6 +134,18 @@ final class PostgresRepositoryPagingTests: XCTestCase {
 
     func testMakeLookupPlanForOffsetIdentity() {
         let plan = PostgresRepository.makeLookupPlan(for: .offset(9))
-        XCTAssertEqual(plan, .offset(9))
+        XCTAssertEqual(plan, .offset(9, sort: nil))
+    }
+
+    func testExplicitSortAcceptsNumericType() {
+        XCTAssertTrue(PostgresRepository.isExplicitlySortableType("int8"))
+    }
+
+    func testExplicitSortRejectsJSONB() {
+        XCTAssertFalse(PostgresRepository.isExplicitlySortableType("jsonb"))
+    }
+
+    func testExplicitSortRejectsArrayType() {
+        XCTAssertFalse(PostgresRepository.isExplicitlySortableType("_int4"))
     }
 }

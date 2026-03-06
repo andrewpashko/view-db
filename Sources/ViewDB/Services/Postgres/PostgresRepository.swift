@@ -51,6 +51,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         let orderColumn: String?
         let strategy: RowPagingStrategy
         let orderType: KeysetValueType?
+        let sort: TableSort?
     }
 
     private struct CollectedRows {
@@ -60,7 +61,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
     }
 
     enum FullValueLookupPlan: Equatable {
-        case offset(Int)
+        case offset(Int, sort: TableSort?)
         case columnValue(column: String, literal: String)
         case ctid(literal: String)
     }
@@ -220,7 +221,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                 offset: logicalOffset,
                 hasNext: nextCursor != nil || (hasNext && !queryPlan.strategy.usesCursor),
                 strategy: queryPlan.strategy,
-                orderedByColumn: queryPlan.orderColumn,
+                sort: queryPlan.sort,
                 nextCursor: nextCursor,
                 previousCursor: cursorPair.previous
             )
@@ -304,6 +305,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                     strategy: queryPlan.strategy,
                     orderColumn: queryPlan.orderColumn,
                     orderType: queryPlan.orderType,
+                    sort: queryPlan.sort,
                     row: row,
                     hiddenCursor: collected.hiddenCursors?[safe: rowOffset],
                     columns: pagingPlan.columns,
@@ -330,7 +332,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                 offset: logicalOffset,
                 hasNext: nextCursor != nil || (hasNext && !queryPlan.strategy.usesCursor),
                 strategy: queryPlan.strategy,
-                orderedByColumn: queryPlan.orderColumn,
+                sort: queryPlan.sort,
                 nextCursor: nextCursor,
                 previousCursor: cursorPair.previous
             )
@@ -354,6 +356,11 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
 
     func fetchCellValue(database: DatabaseRef, table: TableRef, rowIdentity: RowIdentity, columnName: String) async throws -> String {
         let instance = try await resolveInstance(for: database)
+        let pagingPlan = try await resolvePagingPlan(
+            database: database,
+            table: table,
+            instance: instance
+        )
         let safeSchema = Self.quoteIdentifier(table.schema)
         let safeTable = Self.quoteIdentifier(table.name)
         let safeColumn = Self.quoteIdentifier(columnName)
@@ -364,8 +371,9 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
 
             let sql: String
             switch lookupPlan {
-            case .offset(let offset):
-                sql = "SELECT \(safeColumn) FROM \(safeSchema).\(safeTable) LIMIT 1 OFFSET \(max(0, offset))"
+            case .offset(let offset, let sort):
+                let orderByClause = Self.explicitSortClause(sort: sort, pagingPlan: pagingPlan)
+                sql = "SELECT \(safeColumn) FROM \(safeSchema).\(safeTable)\(orderByClause ?? "") LIMIT 1 OFFSET \(max(0, offset))"
             case .columnValue(let column, let literal):
                 let safeLookupColumn = Self.quoteIdentifier(column)
                 sql = "SELECT \(safeColumn) FROM \(safeSchema).\(safeTable) WHERE \(safeLookupColumn) = \(literal) LIMIT 1"
@@ -447,7 +455,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                 offset: 0,
                 hasNext: hasNext,
                 strategy: .offset,
-                orderedByColumn: nil,
+                sort: nil,
                 nextCursor: nil,
                 previousCursor: nil
             )
@@ -626,6 +634,22 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         let baseTable = "\(safeSchema).\(safeTable)"
         let normalizedOffset = max(0, request.offset)
 
+        if let explicitSortClause = explicitSortClause(sort: request.sort, pagingPlan: pagingPlan) {
+            return QueryExecutionPlan(
+                sql: offsetQuery(
+                    baseTable: baseTable,
+                    limit: limit,
+                    offset: normalizedOffset,
+                    orderByClause: explicitSortClause
+                ),
+                hiddenLeadingCursor: false,
+                orderColumn: nil,
+                strategy: .offset,
+                orderType: nil,
+                sort: normalizeSort(request.sort, pagingPlan: pagingPlan)
+            )
+        }
+
         switch pagingPlan.strategy {
         case .offset:
             return QueryExecutionPlan(
@@ -633,23 +657,25 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                     baseTable: baseTable,
                     limit: limit,
                     offset: normalizedOffset,
-                    orderedBy: nil
+                    orderByClause: nil
                 ),
                 hiddenLeadingCursor: false,
                 orderColumn: nil,
                 strategy: .offset,
-                orderType: nil
+                orderType: nil,
+                sort: nil
             )
 
         case .keysetID, .keysetPrimaryKey:
             guard let orderColumn = pagingPlan.orderColumn,
                   let orderType = pagingPlan.orderType else {
                 return QueryExecutionPlan(
-                    sql: offsetQuery(baseTable: baseTable, limit: limit, offset: normalizedOffset, orderedBy: nil),
+                    sql: offsetQuery(baseTable: baseTable, limit: limit, offset: normalizedOffset, orderByClause: nil),
                     hiddenLeadingCursor: false,
                     orderColumn: nil,
                     strategy: .offset,
-                    orderType: nil
+                    orderType: nil,
+                    sort: nil
                 )
             }
 
@@ -665,7 +691,8 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                 hiddenLeadingCursor: false,
                 orderColumn: orderColumn,
                 strategy: pagingPlan.strategy,
-                orderType: orderType
+                orderType: orderType,
+                sort: nil
             )
 
         case .keysetCTID:
@@ -675,7 +702,8 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                 hiddenLeadingCursor: true,
                 orderColumn: "ctid",
                 strategy: .keysetCTID,
-                orderType: .ctid
+                orderType: .ctid,
+                sort: nil
             )
         }
     }
@@ -690,7 +718,12 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         let safeOrderColumn = quoteIdentifier(orderColumn)
 
         if request.direction == .initial && request.offset > 0 {
-            return offsetQuery(baseTable: baseTable, limit: limit, offset: request.offset, orderedBy: safeOrderColumn)
+            return offsetQuery(
+                baseTable: baseTable,
+                limit: limit,
+                offset: request.offset,
+                orderByClause: " ORDER BY \(safeOrderColumn) ASC"
+            )
         }
 
         let orderDirection: String = request.direction == .previous ? "DESC" : "ASC"
@@ -702,7 +735,12 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
             let comparator = request.direction == .previous ? "<" : ">"
             sql += " WHERE \(safeOrderColumn) \(comparator) \(literal)"
         } else if request.direction != .initial {
-            return offsetQuery(baseTable: baseTable, limit: limit, offset: request.offset, orderedBy: safeOrderColumn)
+            return offsetQuery(
+                baseTable: baseTable,
+                limit: limit,
+                offset: request.offset,
+                orderByClause: " ORDER BY \(safeOrderColumn) ASC"
+            )
         }
 
         sql += " ORDER BY \(safeOrderColumn) \(orderDirection) LIMIT \(limit + 1)"
@@ -734,10 +772,10 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         return sql
     }
 
-    private static func offsetQuery(baseTable: String, limit: Int, offset: Int, orderedBy: String?) -> String {
+    private static func offsetQuery(baseTable: String, limit: Int, offset: Int, orderByClause: String?) -> String {
         var sql = "SELECT * FROM \(baseTable)"
-        if let orderedBy {
-            sql += " ORDER BY \(orderedBy) ASC"
+        if let orderByClause {
+            sql += orderByClause
         }
         sql += " LIMIT \(limit + 1) OFFSET \(max(0, offset))"
         return sql
@@ -827,6 +865,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         strategy: RowPagingStrategy,
         orderColumn: String?,
         orderType: KeysetValueType?,
+        sort: TableSort?,
         row: [String],
         hiddenCursor: String?,
         columns: [String],
@@ -839,23 +878,23 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                   let valueType = orderType.rowIdentityValueType,
                   let index = columns.firstIndex(of: orderColumn),
                   let value = row[safe: index] else {
-                return .offset(fallbackOffset)
+                return .offset(fallbackOffset, sort: sort)
             }
             return .columnValue(column: orderColumn, value: value, valueType: valueType)
         case .keysetCTID:
             guard let hiddenCursor else {
-                return .offset(fallbackOffset)
+                return .offset(fallbackOffset, sort: sort)
             }
             return .ctid(hiddenCursor)
         case .offset:
-            return .offset(fallbackOffset)
+            return .offset(fallbackOffset, sort: sort)
         }
     }
 
     static func makeLookupPlan(for rowIdentity: RowIdentity) -> FullValueLookupPlan {
         switch rowIdentity {
-        case .offset(let value):
-            return .offset(max(0, value))
+        case .offset(let value, let sort):
+            return .offset(max(0, value), sort: sort)
         case .columnValue(let column, let value, let valueType):
             let literal: String
             switch valueType {
@@ -908,6 +947,50 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
 
     static func makeColumnTypeNames(columns: [(name: String, udtName: String)]) -> [String] {
         columns.map { $0.udtName.lowercased() }
+    }
+
+    private static func normalizeSort(_ sort: TableSort?, pagingPlan: TablePagingPlan) -> TableSort? {
+        guard let sort,
+              let index = pagingPlan.columns.firstIndex(of: sort.column),
+              let type = pagingPlan.columnTypeNames[safe: index],
+              isExplicitlySortableType(type) else {
+            return nil
+        }
+        return TableSort(column: pagingPlan.columns[index], direction: sort.direction)
+    }
+
+    private static func explicitSortClause(sort: TableSort?, pagingPlan: TablePagingPlan) -> String? {
+        guard let normalized = normalizeSort(sort, pagingPlan: pagingPlan) else {
+            return nil
+        }
+
+        let direction = normalized.direction == .ascending ? "ASC" : "DESC"
+        var orderBy = "\(quoteIdentifier(normalized.column)) \(direction) NULLS LAST"
+        if let tieBreaker = pagingPlan.orderColumn,
+           tieBreaker != normalized.column {
+            if tieBreaker == "ctid" {
+                orderBy += ", ctid ASC"
+            } else {
+                orderBy += ", \(quoteIdentifier(tieBreaker)) ASC"
+            }
+        }
+        return " ORDER BY \(orderBy)"
+    }
+
+    static func isExplicitlySortableType(_ udtName: String) -> Bool {
+        let normalized = udtName.lowercased()
+        guard !normalized.hasPrefix("_") else {
+            return false
+        }
+
+        let sortableTypes: Set<String> = [
+            "bool",
+            "int2", "int4", "int8", "float4", "float8", "numeric", "oid",
+            "text", "varchar", "bpchar", "name",
+            "uuid",
+            "date", "time", "timetz", "timestamp", "timestamptz",
+        ]
+        return sortableTypes.contains(normalized)
     }
 
     private static func keysetType(for udtName: String) -> KeysetValueType? {
