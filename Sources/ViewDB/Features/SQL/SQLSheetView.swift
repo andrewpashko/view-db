@@ -8,6 +8,7 @@ struct SQLSheetView: View {
     let isRunning: Bool
     let errorMessage: String?
     let onRun: () -> Void
+    let onClose: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -15,9 +16,15 @@ struct SQLSheetView: View {
                 Text("Read-only SQL")
                     .font(.title3.bold())
                 Spacer()
+                Button("Close") {
+                    onClose()
+                }
+                .keyboardShortcut(.cancelAction)
+                .disabled(isRunning)
                 Button("Run") {
                     onRun()
                 }
+                .keyboardShortcut(.defaultAction)
                 .viewDBGlassButton(prominent: true)
                 .disabled(isRunning)
             }

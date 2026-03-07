@@ -2,7 +2,7 @@ import Foundation
 import Logging
 import PostgresNIO
 
-actor PostgresRepository: CatalogService, QueryService, CredentialService {
+actor PostgresRepository: CatalogService, QueryService, CredentialService, CellEditingService {
     private struct TableCacheKey: Hashable {
         let databaseID: UUID
         let schema: String
@@ -29,6 +29,12 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
     private struct TableColumnMeta: Sendable {
         let name: String
         let udtName: String
+        let udtSchema: String
+        let isNullable: Bool
+        let hasDefaultValue: Bool
+        let isGenerated: Bool
+        let isUpdatable: Bool
+        let enumOptions: [String]
     }
 
     private struct TableMetadata: Sendable {
@@ -251,6 +257,13 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         let pageLimit = max(1, request.limit)
         let logicalOffset = max(0, request.offset)
         let previewLimit = max(16, previewLimitChars)
+        let cacheKey = TableCacheKey(databaseID: table.databaseID, schema: table.schema, table: table.name)
+        let metadata = try await resolveTableMetadata(
+            database: database,
+            table: table,
+            instance: instance,
+            key: cacheKey
+        )
         let pagingPlan = try await resolvePagingPlan(
             database: database,
             table: table,
@@ -314,7 +327,18 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                 let previewValues = row.map { value in
                     Self.makePreviewCellValue(value: value, maxChars: previewLimit)
                 }
-                return TableRowItem(id: logicalOffset + rowOffset, identity: identity, values: previewValues)
+                let editLocator = Self.makeRowEditLocator(
+                    row: row,
+                    columns: metadata.columns.map { ($0.name, $0.udtName) },
+                    primaryKeyColumns: metadata.primaryKeyColumns,
+                    relationKind: metadata.relationKind
+                )
+                return TableRowItem(
+                    id: logicalOffset + rowOffset,
+                    identity: identity,
+                    values: previewValues,
+                    editLocator: editLocator
+                )
             }
 
             let nextCursor: String?
@@ -400,6 +424,106 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
                 ]
             )
             return value
+        }
+    }
+
+    func fetchEditMetadata(database: DatabaseRef, table: TableRef) async throws -> [ColumnEditDescriptor] {
+        let instance = try await resolveInstance(for: database)
+        let key = TableCacheKey(databaseID: table.databaseID, schema: table.schema, table: table.name)
+        let metadata = try await resolveTableMetadata(database: database, table: table, instance: instance, key: key)
+        return Self.makeColumnEditDescriptors(from: metadata)
+    }
+
+    func fetchEditableCellValue(
+        database: DatabaseRef,
+        table: TableRef,
+        rowLocator: RowEditLocator,
+        columnName: String
+    ) async throws -> String? {
+        guard !rowLocator.isEmpty else {
+            throw AppError.queryRejected("The selected row is not editable.")
+        }
+        let instance = try await resolveInstance(for: database)
+        let safeSchema = Self.quoteIdentifier(table.schema)
+        let safeTable = Self.quoteIdentifier(table.name)
+        let safeColumn = Self.quoteIdentifier(columnName)
+        let whereClause = Self.makeRowEditWhereClause(rowLocator)
+
+        return try await sessionPool.withConnection(instance: instance, database: database.name) { connection, logger in
+            let sequence = try await connection.query(
+                PostgresQuery(unsafeSQL: "SELECT \(safeColumn) FROM \(safeSchema).\(safeTable) WHERE \(whereClause)"),
+                logger: logger
+            )
+            let rows = try await sequence.collect()
+            guard rows.count == 1,
+                  let cell = rows.first?.first else {
+                throw AppError.queryRejected("Unable to resolve the selected row for editing.")
+            }
+            return Self.displayValueOrNil(cell)
+        }
+    }
+
+    func updateCell(
+        database: DatabaseRef,
+        table: TableRef,
+        rowLocator: RowEditLocator,
+        columnName: String,
+        value: String?
+    ) async throws -> String {
+        guard !rowLocator.isEmpty else {
+            throw AppError.queryRejected("The selected row is not editable.")
+        }
+        let instance = try await resolveInstance(for: database)
+        let key = TableCacheKey(databaseID: table.databaseID, schema: table.schema, table: table.name)
+        let metadata = try await resolveTableMetadata(database: database, table: table, instance: instance, key: key)
+        guard let column = metadata.columns.first(where: { $0.name == columnName }) else {
+            throw AppError.queryRejected("Column \(columnName) is no longer available.")
+        }
+
+        let descriptor = Self.makeColumnEditDescriptor(column: column, relationKind: metadata.relationKind)
+        guard descriptor.isEditable else {
+            throw AppError.queryRejected("This column is read-only.")
+        }
+        if !descriptor.isNullable, value == nil {
+            throw AppError.queryRejected("This column does not allow NULL values.")
+        }
+        if case .enumeration(let options) = descriptor.editorKind,
+           let value,
+           !options.contains(value) {
+            throw AppError.queryRejected("The selected value is not valid for \(columnName).")
+        }
+        if descriptor.editorKind == .boolean,
+           let value {
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard ["true", "false", "t", "f", "1", "0"].contains(normalized) else {
+                throw AppError.queryRejected("Boolean columns accept true or false.")
+            }
+        }
+
+        let safeSchema = Self.quoteIdentifier(table.schema)
+        let safeTable = Self.quoteIdentifier(table.name)
+        let safeColumn = Self.quoteIdentifier(columnName)
+        let whereClause = Self.makeRowEditWhereClause(rowLocator)
+        let assignedValue = Self.sqlLiteral(for: value)
+        let sql = """
+            UPDATE \(safeSchema).\(safeTable)
+            SET \(safeColumn) = \(assignedValue)
+            WHERE \(whereClause)
+            RETURNING \(safeColumn)
+            """
+
+        return try await sessionPool.withConnection(
+            instance: instance,
+            database: database.name,
+            readOnly: false
+        ) { connection, logger in
+            let sequence = try await connection.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+            let rows = try await sequence.collect()
+            guard rows.count == 1,
+                  let cell = rows.first?.first else {
+                throw AppError.queryRejected("Expected to update exactly one row.")
+            }
+            return Self.displayValue(cell)
         }
     }
 
@@ -559,9 +683,35 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         }
 
         let metadata = try await sessionPool.withConnection(instance: instance, database: database.name) { connection, logger in
+            let enumSequence = try await connection.query(
+                """
+                SELECT a.attname, e.enumlabel
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                JOIN pg_type t ON t.oid = a.atttypid
+                JOIN pg_enum e ON e.enumtypid = t.oid
+                WHERE n.nspname = \(table.schema)
+                  AND c.relname = \(table.name)
+                ORDER BY a.attnum, e.enumsortorder
+                """,
+                logger: logger
+            )
+            let enumRows = try await enumSequence.collect()
+            var enumOptionsByColumn: [String: [String]] = [:]
+            for row in enumRows {
+                let cells = Array(row)
+                guard cells.count >= 2,
+                      let columnName = try? cells[0].decode(String.self),
+                      let value = try? cells[1].decode(String.self) else {
+                    continue
+                }
+                enumOptionsByColumn[columnName, default: []].append(value)
+            }
+
             let columnsSequence = try await connection.query(
                 """
-                SELECT column_name, udt_name
+                SELECT column_name, udt_name, udt_schema, is_nullable, column_default IS NOT NULL, is_generated, is_updatable
                 FROM information_schema.columns
                 WHERE table_schema = \(table.schema)
                   AND table_name = \(table.name)
@@ -572,12 +722,26 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
             let columnRows = try await columnsSequence.collect()
             let columns = columnRows.compactMap { row -> TableColumnMeta? in
                 let cells = Array(row)
-                guard cells.count >= 2,
+                guard cells.count >= 7,
                       let name = try? cells[0].decode(String.self),
-                      let udtName = try? cells[1].decode(String.self) else {
+                      let udtName = try? cells[1].decode(String.self),
+                      let udtSchema = try? cells[2].decode(String.self),
+                      let isNullableValue = try? cells[3].decode(String.self),
+                      let hasDefaultValue = try? cells[4].decode(Bool.self),
+                      let generatedValue = try? cells[5].decode(String.self),
+                      let isUpdatableValue = try? cells[6].decode(String.self) else {
                     return nil
                 }
-                return TableColumnMeta(name: name, udtName: udtName.lowercased())
+                return TableColumnMeta(
+                    name: name,
+                    udtName: udtName.lowercased(),
+                    udtSchema: udtSchema,
+                    isNullable: isNullableValue.uppercased() == "YES",
+                    hasDefaultValue: hasDefaultValue,
+                    isGenerated: generatedValue.uppercased() != "NEVER",
+                    isUpdatable: isUpdatableValue.uppercased() == "YES",
+                    enumOptions: enumOptionsByColumn[name] ?? []
+                )
             }
 
             let pkSequence = try await connection.query(
@@ -914,6 +1078,80 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         }
     }
 
+    static func makeRowEditLocator(
+        row: [String],
+        columns: [(name: String, udtName: String)],
+        primaryKeyColumns: [String],
+        relationKind: String?
+    ) -> RowEditLocator? {
+        guard relationKind == "r" || relationKind == "p",
+              !primaryKeyColumns.isEmpty else {
+            return nil
+        }
+
+        let columnLookup = Dictionary(uniqueKeysWithValues: columns.enumerated().map { ($0.element.name, $0.offset) })
+        let typeLookup = Dictionary(uniqueKeysWithValues: columns.map { ($0.name, $0.udtName) })
+        let keys = primaryKeyColumns.compactMap { columnName -> RowEditKey? in
+            guard let index = columnLookup[columnName],
+                  let value = row[safe: index],
+                  let typeName = typeLookup[columnName] else {
+                return nil
+            }
+            return RowEditKey(columnName: columnName, value: value, typeName: typeName)
+        }
+
+        guard keys.count == primaryKeyColumns.count else {
+            return nil
+        }
+        return RowEditLocator(keys: keys)
+    }
+
+    static func makeColumnEditDescriptor(
+        columnName: String,
+        typeName: String,
+        enumOptions: [String] = [],
+        isNullable: Bool,
+        hasDefaultValue: Bool,
+        isGenerated: Bool,
+        isUpdatable: Bool,
+        relationKind: String?
+    ) -> ColumnEditDescriptor {
+        makeColumnEditDescriptor(
+            column: TableColumnMeta(
+                name: columnName,
+                udtName: typeName,
+                udtSchema: "public",
+                isNullable: isNullable,
+                hasDefaultValue: hasDefaultValue,
+                isGenerated: isGenerated,
+                isUpdatable: isUpdatable,
+                enumOptions: enumOptions
+            ),
+            relationKind: relationKind
+        )
+    }
+
+    private static func makeColumnEditDescriptors(from metadata: TableMetadata) -> [ColumnEditDescriptor] {
+        metadata.columns.map { makeColumnEditDescriptor(column: $0, relationKind: metadata.relationKind) }
+    }
+
+    private static func makeColumnEditDescriptor(column: TableColumnMeta, relationKind: String?) -> ColumnEditDescriptor {
+        let normalizedType = column.udtName.lowercased()
+        let isRelationEditable = relationKind == "r" || relationKind == "p"
+        let isSupported = isSupportedEditableType(normalizedType, enumOptions: column.enumOptions)
+        let editorKind = makeColumnEditorKind(typeName: normalizedType, enumOptions: column.enumOptions)
+
+        return ColumnEditDescriptor(
+            columnName: column.name,
+            typeName: normalizedType,
+            isEditable: isRelationEditable && column.isUpdatable && !column.isGenerated && isSupported,
+            isNullable: column.isNullable,
+            hasDefaultValue: column.hasDefaultValue,
+            isGenerated: column.isGenerated,
+            editorKind: editorKind
+        )
+    }
+
     private func invalidateTableCaches(for databaseID: UUID) {
         tableMetadataCache = tableMetadataCache.filter { $0.key.databaseID != databaseID }
         tablePagingPlanCache = tablePagingPlanCache.filter { $0.key.databaseID != databaseID }
@@ -1020,6 +1258,39 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         return nil
     }
 
+    private static func isSupportedEditableType(_ udtName: String, enumOptions: [String]) -> Bool {
+        guard !udtName.hasPrefix("_"),
+              udtName != "bytea" else {
+            return false
+        }
+        if !enumOptions.isEmpty {
+            return true
+        }
+
+        let supportedTypes: Set<String> = [
+            "bool",
+            "int2", "int4", "int8", "float4", "float8", "numeric", "oid",
+            "text", "varchar", "bpchar", "name",
+            "uuid",
+            "date", "time", "timetz", "timestamp", "timestamptz",
+            "json", "jsonb",
+        ]
+        return supportedTypes.contains(udtName)
+    }
+
+    private static func makeColumnEditorKind(typeName: String, enumOptions: [String]) -> ColumnEditorKind {
+        if !enumOptions.isEmpty {
+            return .enumeration(options: enumOptions)
+        }
+        if typeName == "bool" {
+            return .boolean
+        }
+        if ["json", "jsonb", "text"].contains(typeName) {
+            return .textArea
+        }
+        return .textField
+    }
+
     private static func sqlLiteral(for cursor: String, type: KeysetValueType) -> String? {
         switch type {
         case .numeric:
@@ -1034,6 +1305,19 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
         case .ctid:
             return "'\(escapeSQLLiteral(cursor))'::tid"
         }
+    }
+
+    private static func sqlLiteral(for value: String?) -> String {
+        guard let value else {
+            return "NULL"
+        }
+        return "'\(escapeSQLLiteral(value))'"
+    }
+
+    private static func makeRowEditWhereClause(_ rowLocator: RowEditLocator) -> String {
+        rowLocator.keys
+            .map { "\(quoteIdentifier($0.columnName)) = \(sqlLiteral(for: $0.value))" }
+            .joined(separator: " AND ")
     }
 
     private static func escapeSQLLiteral(_ value: String) -> String {
@@ -1071,6 +1355,13 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService {
             }
             return rawValue(cell)
         }
+    }
+
+    private static func displayValueOrNil(_ cell: PostgresCell) -> String? {
+        guard cell.bytes != nil else {
+            return nil
+        }
+        return displayValue(cell)
     }
 
     private static func rawValue(_ cell: PostgresCell) -> String {

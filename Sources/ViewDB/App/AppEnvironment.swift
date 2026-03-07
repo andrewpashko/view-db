@@ -12,6 +12,10 @@ struct AppEnvironment {
         postgresRepository
     }
 
+    var cellEditingService: any CellEditingService {
+        postgresRepository
+    }
+
     static func live() -> AppEnvironment {
         let shell = ShellCommandRunner()
         let providers: [any DiscoveryProvider] = [

@@ -81,6 +81,91 @@ final class DataGridViewCoordinatorTests: XCTestCase {
         XCTAssertEqual(huge, 540)
     }
 
+    func testResponsivePopoverPlacementPrefersBelowWhenThereIsMoreSpace() {
+        let placement = DataGridView.Coordinator.responsivePopoverPlacement(
+            preferredHeight: 320,
+            availableAbove: 140,
+            availableBelow: 420
+        )
+
+        XCTAssertEqual(placement.edge, .maxY)
+        XCTAssertEqual(placement.height, 320)
+    }
+
+    func testResponsivePopoverPlacementPrefersAboveWhenThereIsMoreSpace() {
+        let placement = DataGridView.Coordinator.responsivePopoverPlacement(
+            preferredHeight: 320,
+            availableAbove: 500,
+            availableBelow: 120
+        )
+
+        XCTAssertEqual(placement.edge, .minY)
+        XCTAssertEqual(placement.height, 320)
+    }
+
+    func testResponsivePopoverPlacementClampsHeightToUsableViewport() {
+        let placement = DataGridView.Coordinator.responsivePopoverPlacement(
+            preferredHeight: 420,
+            availableAbove: 90,
+            availableBelow: 120
+        )
+
+        XCTAssertEqual(placement.edge, .maxY)
+        XCTAssertEqual(placement.height, 104)
+    }
+
+    func testEditorDraftRequiresDirtyValueToSave() {
+        let draft = GridCellEditorDraft(
+            originalValue: "demo",
+            currentValue: "demo",
+            descriptor: ColumnEditDescriptor(
+                columnName: "name",
+                typeName: "text",
+                isEditable: true,
+                isNullable: false,
+                hasDefaultValue: false,
+                isGenerated: false,
+                editorKind: .textField
+            )
+        )
+
+        XCTAssertFalse(draft.canSave)
+    }
+
+    func testEditorDraftRejectsInvalidBooleanValue() {
+        let draft = GridCellEditorDraft(
+            originalValue: "false",
+            currentValue: "maybe",
+            descriptor: ColumnEditDescriptor(
+                columnName: "enabled",
+                typeName: "bool",
+                isEditable: true,
+                isNullable: false,
+                hasDefaultValue: false,
+                isGenerated: false,
+                editorKind: .boolean
+            )
+        )
+
+        XCTAssertFalse(draft.isValid)
+        XCTAssertFalse(draft.canSave)
+    }
+
+    func testFormatEditorValueNormalizesBooleanAliases() {
+        let descriptor = ColumnEditDescriptor(
+            columnName: "enabled",
+            typeName: "bool",
+            isEditable: true,
+            isNullable: false,
+            hasDefaultValue: false,
+            isGenerated: false,
+            editorKind: .boolean
+        )
+
+        XCTAssertEqual(DataGridView.Coordinator.formatEditorValue("t", descriptor: descriptor), "true")
+        XCTAssertEqual(DataGridView.Coordinator.unformatEditorValue("0", descriptor: descriptor), "false")
+    }
+
     func testCoordinatorSkipsReloadWhenPayloadIsUnchanged() {
         let coordinator = DataGridView.Coordinator()
         let tableView = ReloadTrackingTableView()

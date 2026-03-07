@@ -139,6 +139,14 @@ struct HomeView: View {
         .frame(height: 44)
         .frame(maxWidth: .infinity)
         .viewDBGlassCard(interactive: true, cornerRadius: 22)
+        .overlay(
+            RoundedRectangle(cornerRadius: 22)
+                .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            isSearchFocused = true
+        }
     }
 
     @ViewBuilder

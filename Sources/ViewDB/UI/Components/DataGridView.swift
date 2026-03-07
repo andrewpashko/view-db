@@ -12,35 +12,53 @@ private enum DataGridMetrics {
     static let popoverMaxWidth: CGFloat = 760
     static let popoverMinHeight: CGFloat = 72
     static let popoverMaxHeight: CGFloat = 540
+    static let popoverWindowPadding: CGFloat = 16
+    static let popoverArrowClearance: CGFloat = 16
 }
 
 struct DataGridView: NSViewRepresentable {
     typealias FullValueProvider = (_ rowIdentity: RowIdentity, _ columnName: String) async -> String?
+    typealias BeginEditValueProvider = (_ row: TableRowItem, _ columnName: String) async -> String?
+    enum CommitEditOutcome: Equatable {
+        case success(String)
+        case failure(String)
+    }
+
+    typealias CommitEditProvider = (_ row: TableRowItem, _ columnName: String, _ value: String?) async -> CommitEditOutcome
 
     let columns: [String]
     let columnTypeNames: [String]
+    let columnEditDescriptors: [ColumnEditDescriptor]
     let rows: [TableRowItem]
     let activeSort: TableSort?
     let sortableColumns: Set<String>
     let onToggleSort: ((String) -> Void)?
     let onRequestFullValue: FullValueProvider?
+    let onBeginEdit: BeginEditValueProvider?
+    let onCommitEdit: CommitEditProvider?
 
     init(
         columns: [String],
         columnTypeNames: [String] = [],
+        columnEditDescriptors: [ColumnEditDescriptor] = [],
         rows: [TableRowItem],
         activeSort: TableSort? = nil,
         sortableColumns: Set<String> = [],
         onToggleSort: ((String) -> Void)? = nil,
-        onRequestFullValue: FullValueProvider? = nil
+        onRequestFullValue: FullValueProvider? = nil,
+        onBeginEdit: BeginEditValueProvider? = nil,
+        onCommitEdit: CommitEditProvider? = nil
     ) {
         self.columns = columns
         self.columnTypeNames = columnTypeNames
+        self.columnEditDescriptors = columnEditDescriptors
         self.rows = rows
         self.activeSort = activeSort
         self.sortableColumns = sortableColumns
         self.onToggleSort = onToggleSort
         self.onRequestFullValue = onRequestFullValue
+        self.onBeginEdit = onBeginEdit
+        self.onCommitEdit = onCommitEdit
     }
 
     func makeCoordinator() -> Coordinator {
@@ -87,10 +105,13 @@ struct DataGridView: NSViewRepresentable {
             columns: columns,
             rows: rows,
             columnTypeNames: columnTypeNames,
+            columnEditDescriptors: columnEditDescriptors,
             activeSort: activeSort,
             sortableColumns: sortableColumns,
             onToggleSort: onToggleSort,
-            onRequestFullValue: onRequestFullValue
+            onRequestFullValue: onRequestFullValue,
+            onBeginEdit: onBeginEdit,
+            onCommitEdit: onCommitEdit
         )
         return scrollView
     }
@@ -101,10 +122,13 @@ struct DataGridView: NSViewRepresentable {
             columns: columns,
             rows: rows,
             columnTypeNames: columnTypeNames,
+            columnEditDescriptors: columnEditDescriptors,
             activeSort: activeSort,
             sortableColumns: sortableColumns,
             onToggleSort: onToggleSort,
-            onRequestFullValue: onRequestFullValue
+            onRequestFullValue: onRequestFullValue,
+            onBeginEdit: onBeginEdit,
+            onCommitEdit: onCommitEdit
         )
     }
 
@@ -125,6 +149,13 @@ class GridTableView: NSTableView {
     var onCopyCommand: (() -> Void)?
     var onCellInteraction: ((Int, Int) -> Void)?
     var onPrimaryCellClick: ((Int, Int) -> Void)?
+    var onPrimaryCellDoubleClick: ((Int, Int) -> Void)?
+    var onBeginEditCommand: (() -> Void)?
+    var onEscapeCommand: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool {
+        false
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.modifierFlags.contains(.command),
@@ -138,9 +169,26 @@ class GridTableView: NSTableView {
 
     override func mouseDown(with event: NSEvent) {
         if let cell = updateFocusedCell(from: event) {
-            onPrimaryCellClick?(cell.row, cell.column)
+            if event.clickCount >= 2 {
+                onPrimaryCellDoubleClick?(cell.row, cell.column)
+            } else {
+                onPrimaryCellClick?(cell.row, cell.column)
+            }
         }
         super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch Int(event.keyCode) {
+        case 36, 76:
+            onBeginEditCommand?()
+            return
+        case 53:
+            onEscapeCommand?()
+            return
+        default:
+            super.keyDown(with: event)
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -196,6 +244,269 @@ private final class GridCellPopoverViewController: NSViewController {
     }
 }
 
+struct GridCellEditorDraft: Equatable {
+    let originalValue: String?
+    let descriptor: ColumnEditDescriptor
+    var value: String
+    var isNull: Bool
+    var errorMessage: String?
+    var isSaving: Bool
+
+    init(
+        originalValue: String?,
+        currentValue: String?,
+        descriptor: ColumnEditDescriptor,
+        errorMessage: String? = nil,
+        isSaving: Bool = false
+    ) {
+        let resolvedValue: String
+        if let currentValue {
+            resolvedValue = currentValue
+        } else {
+            switch descriptor.editorKind {
+            case .boolean:
+                resolvedValue = "false"
+            case .enumeration(let options):
+                resolvedValue = options.first ?? ""
+            case .textField, .textArea:
+                resolvedValue = ""
+            }
+        }
+
+        self.originalValue = originalValue
+        self.descriptor = descriptor
+        self.value = resolvedValue
+        self.isNull = currentValue == nil
+        self.errorMessage = errorMessage
+        self.isSaving = isSaving
+    }
+
+    var normalizedValue: String? {
+        if isNull {
+            return nil
+        }
+        return value
+    }
+
+    var isDirty: Bool {
+        normalizedValue != originalValue
+    }
+
+    var isValid: Bool {
+        if isNull {
+            return descriptor.isNullable
+        }
+
+        switch descriptor.editorKind {
+        case .boolean:
+            return ["true", "false"].contains(value.lowercased())
+        case .enumeration(let options):
+            return options.contains(value)
+        case .textField, .textArea:
+            return true
+        }
+    }
+
+    var canSave: Bool {
+        isDirty && isValid && !isSaving
+    }
+}
+
+private struct GridCellEditorView: View {
+    let title: String
+    let descriptor: ColumnEditDescriptor
+    let renderID: String
+    let initialOriginalValue: String?
+    let initialCurrentValue: String?
+    let initialErrorMessage: String?
+    let initialIsSaving: Bool
+    let onSave: (String?) -> Void
+    let onCancel: () -> Void
+
+    @State private var draft: GridCellEditorDraft
+
+    init(
+        title: String,
+        descriptor: ColumnEditDescriptor,
+        renderID: String,
+        originalValue: String?,
+        currentValue: String?,
+        errorMessage: String? = nil,
+        isSaving: Bool = false,
+        onSave: @escaping (String?) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self.title = title
+        self.descriptor = descriptor
+        self.renderID = renderID
+        self.initialOriginalValue = originalValue
+        self.initialCurrentValue = currentValue
+        self.initialErrorMessage = errorMessage
+        self.initialIsSaving = isSaving
+        self.onSave = onSave
+        self.onCancel = onCancel
+        _draft = State(initialValue: GridCellEditorDraft(
+            originalValue: originalValue,
+            currentValue: currentValue,
+            descriptor: descriptor,
+            errorMessage: errorMessage,
+            isSaving: isSaving
+        ))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(title)
+                    .font(.system(.headline, design: .monospaced))
+                Spacer(minLength: 0)
+                Text(descriptor.typeName)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+
+            if descriptor.isNullable {
+                Toggle("NULL", isOn: $draft.isNull)
+                    .toggleStyle(.checkbox)
+            }
+
+            editor
+                .disabled(draft.isNull || draft.isSaving)
+
+            if let errorMessage = draft.errorMessage, !errorMessage.isEmpty {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            HStack {
+                Spacer(minLength: 0)
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.escape, modifiers: [])
+                saveButton
+            }
+        }
+        .padding(14)
+        .frame(minWidth: DataGridMetrics.popoverMinWidth, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onChange(of: renderID) { _, _ in
+            draft = GridCellEditorDraft(
+                originalValue: initialOriginalValue,
+                currentValue: initialCurrentValue,
+                descriptor: descriptor,
+                errorMessage: initialErrorMessage,
+                isSaving: initialIsSaving
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var editor: some View {
+        switch descriptor.editorKind {
+        case .boolean:
+            Picker("Value", selection: $draft.value) {
+                Text("true").tag("true")
+                Text("false").tag("false")
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+        case .enumeration(let options):
+            Picker("Value", selection: $draft.value) {
+                ForEach(options, id: \.self) { option in
+                    Text(option).tag(option)
+                }
+            }
+            .labelsHidden()
+        case .textArea:
+            TextEditor(text: $draft.value)
+                .font(.system(.body, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: 120, idealHeight: 220, maxHeight: .infinity)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+                }
+        case .textField:
+            TextField("Value", text: $draft.value)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+        }
+    }
+
+    @ViewBuilder
+    private var saveButton: some View {
+        switch descriptor.editorKind {
+        case .textArea:
+            Button("Save") {
+                onSave(draft.normalizedValue)
+            }
+            .keyboardShortcut(.return, modifiers: [.command])
+            .disabled(!draft.canSave)
+        case .boolean, .enumeration, .textField:
+            Button("Save") {
+                onSave(draft.normalizedValue)
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(!draft.canSave)
+        }
+    }
+}
+
+private final class GridCellEditorPopoverViewController: NSViewController {
+    private var hostingController: NSHostingController<GridCellEditorView>?
+
+    override func loadView() {
+        view = NSView()
+    }
+
+    func render(
+        title: String,
+        descriptor: ColumnEditDescriptor,
+        originalValue: String?,
+        currentValue: String?,
+        errorMessage: String?,
+        isSaving: Bool,
+        onSave: @escaping (String?) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        let renderID = [
+            title,
+            descriptor.typeName,
+            String(describing: descriptor.editorKind),
+            originalValue ?? "<nil>",
+            currentValue ?? "<nil>",
+            errorMessage ?? "",
+            isSaving ? "saving" : "idle",
+        ].joined(separator: "|")
+        let rootView = GridCellEditorView(
+            title: title,
+            descriptor: descriptor,
+            renderID: renderID,
+            originalValue: originalValue,
+            currentValue: currentValue,
+            errorMessage: errorMessage,
+            isSaving: isSaving,
+            onSave: onSave,
+            onCancel: onCancel
+        )
+
+        if let hostingController {
+            hostingController.rootView = rootView
+        } else {
+            let controller = NSHostingController(rootView: rootView)
+            addChild(controller)
+            controller.view.translatesAutoresizingMaskIntoConstraints = false
+            view.addSubview(controller.view)
+            NSLayoutConstraint.activate([
+                controller.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                controller.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                controller.view.topAnchor.constraint(equalTo: view.topAnchor),
+                controller.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            ])
+            hostingController = controller
+        }
+    }
+}
+
 extension DataGridView {
     @MainActor
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSPopoverDelegate {
@@ -212,39 +523,64 @@ extension DataGridView {
         private var columns: [String] = []
         private var rows: [TableRowItem] = []
         private var columnTypeNames: [String] = []
+        private var columnEditDescriptors: [ColumnEditDescriptor] = []
         private var activeSort: TableSort?
         private var sortableColumns: Set<String> = []
         private var columnIndexByIdentifier: [NSUserInterfaceItemIdentifier: Int] = [:]
         private var onToggleSort: ((String) -> Void)?
         private var onRequestFullValue: FullValueProvider?
+        private var onBeginEdit: BeginEditValueProvider?
+        private var onCommitEdit: CommitEditProvider?
         private var focusedCell: (row: Int, column: Int)?
 
-        private var popover: NSPopover?
-        private let popoverController = GridCellPopoverViewController()
-        private var popoverCell: (row: Int, column: Int)?
-        private var popoverLoadTask: Task<Void, Never>?
-        private var popoverRequestID: UUID?
+        private var previewPopover: NSPopover?
+        private let previewPopoverController = GridCellPopoverViewController()
+        private var previewPopoverCell: (row: Int, column: Int)?
+        private var previewLoadTask: Task<Void, Never>?
+        private var previewRequestID: UUID?
+
+        private var editorPopover: NSPopover?
+        private let editorPopoverController = GridCellEditorPopoverViewController()
+        private var editorPopoverCell: (row: Int, column: Int)?
+        private var editorOriginalValue: String?
+        private var editorLoadTask: Task<Void, Never>?
+        private var editorSaveTask: Task<Void, Never>?
 
         func attach(tableView: GridTableView) {
             self.tableView = tableView
             tableView.menu = makeContextMenu()
+            tableView.onPrimaryCellDoubleClick = { [weak self] row, column in
+                self?.handleEditRequest(row: row, column: column)
+            }
+            tableView.onBeginEditCommand = { [weak self] in
+                self?.handleBeginEditCommand()
+            }
+            tableView.onEscapeCommand = { [weak self] in
+                self?.handleEscapeCommand()
+            }
         }
 
         func update(
             columns: [String],
             rows: [TableRowItem],
             columnTypeNames: [String] = [],
+            columnEditDescriptors: [ColumnEditDescriptor] = [],
             activeSort: TableSort?,
             sortableColumns: Set<String>,
             onToggleSort: ((String) -> Void)?,
-            onRequestFullValue: FullValueProvider?
+            onRequestFullValue: FullValueProvider?,
+            onBeginEdit: BeginEditValueProvider? = nil,
+            onCommitEdit: CommitEditProvider? = nil
         ) {
             let start = CFAbsoluteTimeGetCurrent()
             self.onRequestFullValue = onRequestFullValue
             self.onToggleSort = onToggleSort
+            self.onBeginEdit = onBeginEdit
+            self.onCommitEdit = onCommitEdit
             let columnsChanged = self.columns != columns
             let rowsChanged = self.rows != rows
             let typesChanged = self.columnTypeNames != columnTypeNames
+            let editDescriptorsChanged = self.columnEditDescriptors != columnEditDescriptors
             let sortChanged = self.activeSort != activeSort
             let sortableChanged = self.sortableColumns != sortableColumns
             var updateReason = "none"
@@ -253,6 +589,7 @@ extension DataGridView {
                 self.columns = columns
                 self.rows = rows
                 self.columnTypeNames = columnTypeNames
+                self.columnEditDescriptors = columnEditDescriptors
                 self.activeSort = activeSort
                 self.sortableColumns = sortableColumns
                 rebuildColumns()
@@ -260,23 +597,29 @@ extension DataGridView {
             } else if rowsChanged {
                 self.rows = rows
                 self.columnTypeNames = columnTypeNames
+                self.columnEditDescriptors = columnEditDescriptors
                 self.activeSort = activeSort
                 self.sortableColumns = sortableColumns
                 tableView?.reloadData()
                 updateReason = "rows"
             } else if typesChanged {
                 self.columnTypeNames = columnTypeNames
+                self.columnEditDescriptors = columnEditDescriptors
                 self.activeSort = activeSort
                 self.sortableColumns = sortableColumns
                 updateReason = "types"
+            } else if editDescriptorsChanged {
+                self.columnEditDescriptors = columnEditDescriptors
+                updateReason = "edit-meta"
             } else if sortChanged || sortableChanged {
                 self.activeSort = activeSort
                 self.sortableColumns = sortableColumns
                 updateReason = sortChanged ? "sort" : "sortable"
             }
 
-            if columnsChanged || rowsChanged || typesChanged {
-                closePopover()
+            if columnsChanged || rowsChanged || typesChanged || editDescriptorsChanged {
+                closePreviewPopover()
+                closeEditorPopover()
             }
 
             if columnsChanged || sortChanged || sortableChanged {
@@ -366,7 +709,7 @@ extension DataGridView {
             guard let rowItem = rows[safe: row],
                   let value = rowItem.values[safe: column],
                   let columnName = columns[safe: column] else {
-                closePopover()
+                closePreviewPopover()
                 return
             }
 
@@ -375,13 +718,13 @@ extension DataGridView {
             let clickedCell = (row: row, column: column)
 
             switch Self.nextPopoverIntent(
-                currentCell: popoverCell,
-                isPopoverShown: popover?.isShown == true,
+                currentCell: previewPopoverCell,
+                isPopoverShown: previewPopover?.isShown == true,
                 clickedCell: clickedCell,
                 shouldOpen: shouldOpen
             ) {
             case .close:
-                closePopover()
+                closePreviewPopover()
                 return
             case .open:
                 break
@@ -389,13 +732,14 @@ extension DataGridView {
 
             let columnTypeName = columnTypeNames[safe: column]
             let initialText = Self.formatPopoverValue(value.previewText, columnTypeName: columnTypeName)
-            showPopover(for: clickedCell, text: initialText)
+            closeEditorPopover()
+            showPreviewPopover(for: clickedCell, text: initialText)
 
-            popoverLoadTask?.cancel()
+            previewLoadTask?.cancel()
             let requestID = UUID()
-            popoverRequestID = requestID
+            previewRequestID = requestID
 
-            popoverLoadTask = Task { [weak self] in
+            previewLoadTask = Task { [weak self] in
                 guard let self else { return }
                 let resolvedText = await self.resolvePopoverText(
                     rowItem: rowItem,
@@ -404,15 +748,91 @@ extension DataGridView {
                     columnIndex: column
                 )
                 await MainActor.run {
-                    guard self.popoverRequestID == requestID,
-                          let current = self.popoverCell,
+                    guard self.previewRequestID == requestID,
+                          let current = self.previewPopoverCell,
                           current.row == clickedCell.row,
                           current.column == clickedCell.column,
-                          self.popover?.isShown == true else {
+                          self.previewPopover?.isShown == true else {
                         return
                     }
-                    self.updatePopoverContent(resolvedText, forColumn: clickedCell.column)
+                    self.updatePreviewPopoverContent(resolvedText, forColumn: clickedCell.column)
                 }
+            }
+        }
+
+        func handleEditRequest(row: Int, column: Int) {
+            guard let rowItem = rows[safe: row],
+                  rowItem.editLocator != nil,
+                  let columnName = columns[safe: column],
+                  let descriptor = editDescriptor(for: column),
+                  descriptor.isEditable else {
+                return
+            }
+
+            closePreviewPopover()
+            closeEditorPopover()
+            editorLoadTask?.cancel()
+            editorSaveTask?.cancel()
+
+            let clickedCell = (row: row, column: column)
+            let fallbackValue = rowItem.values[safe: column]?.previewText
+            let fallbackText: String?
+            if let fallbackValue, fallbackValue != "NULL" {
+                fallbackText = Self.formatEditorValue(fallbackValue, descriptor: descriptor)
+            } else {
+                fallbackText = nil
+            }
+            editorOriginalValue = fallbackText
+
+            showEditorPopover(
+                for: clickedCell,
+                descriptor: descriptor,
+                originalValue: fallbackText,
+                currentValue: fallbackText,
+                errorMessage: nil,
+                isSaving: false
+            )
+
+            editorLoadTask = Task { [weak self] in
+                guard let self,
+                      let onBeginEdit = self.onBeginEdit else { return }
+                let fullValue = await onBeginEdit(rowItem, columnName)
+                await MainActor.run {
+                    guard let current = self.editorPopoverCell,
+                          current.row == clickedCell.row,
+                          current.column == clickedCell.column,
+                          self.editorPopover?.isShown == true else {
+                        return
+                    }
+                    self.showEditorPopover(
+                        for: clickedCell,
+                        descriptor: descriptor,
+                        originalValue: fullValue.map { Self.formatEditorValue($0, descriptor: descriptor) },
+                        currentValue: fullValue.map { Self.formatEditorValue($0, descriptor: descriptor) },
+                        errorMessage: nil,
+                        isSaving: false
+                    )
+                    self.editorOriginalValue = fullValue.map { Self.formatEditorValue($0, descriptor: descriptor) }
+                }
+            }
+        }
+
+        func handleBeginEditCommand() {
+            guard let tableView,
+                  let target = targetCell(from: tableView) else {
+                return
+            }
+            handleEditRequest(row: target.row, column: target.column)
+        }
+
+        func handleEscapeCommand() {
+            if editorPopover?.isShown == true {
+                closeEditorPopover()
+                return
+            }
+
+            if previewPopover?.isShown == true {
+                closePreviewPopover()
             }
         }
 
@@ -436,10 +856,29 @@ extension DataGridView {
         }
 
         func popoverDidClose(_ notification: Notification) {
-            popoverLoadTask?.cancel()
-            popoverLoadTask = nil
-            popoverRequestID = nil
-            popoverCell = nil
+            guard let popover = notification.object as? NSPopover else { return }
+
+            if popover.contentViewController === previewPopoverController {
+                previewLoadTask?.cancel()
+                previewLoadTask = nil
+                previewRequestID = nil
+                previewPopoverCell = nil
+                if popover === previewPopover {
+                    previewPopover = nil
+                }
+            }
+
+            if popover.contentViewController === editorPopoverController {
+                editorLoadTask?.cancel()
+                editorSaveTask?.cancel()
+                editorLoadTask = nil
+                editorSaveTask = nil
+                editorPopoverCell = nil
+                editorOriginalValue = nil
+                if popover === editorPopover {
+                    editorPopover = nil
+                }
+            }
         }
 
         private func resolvePopoverText(
@@ -475,6 +914,11 @@ extension DataGridView {
             }
 
             return value.previewText
+        }
+
+        private func editDescriptor(for column: Int) -> ColumnEditDescriptor? {
+            guard let columnName = columns[safe: column] else { return nil }
+            return columnEditDescriptors.first(where: { $0.columnName == columnName })
         }
 
         private func targetCell(from tableView: GridTableView) -> (row: Int, column: Int)? {
@@ -580,58 +1024,213 @@ extension DataGridView {
             return menu
         }
 
-        private func showPopover(for cell: (row: Int, column: Int), text: String) {
+        private func showPreviewPopover(for cell: (row: Int, column: Int), text: String) {
             guard let tableView else { return }
             guard rows.indices.contains(cell.row), columns.indices.contains(cell.column) else { return }
 
-            let popover = makePopoverIfNeeded()
-            updatePopoverContent(text, forColumn: cell.column)
-
-            if popover.isShown {
-                popover.performClose(nil)
-            }
+            closePreviewPopover()
+            let popover = makePreviewPopoverIfNeeded()
+            updatePreviewPopoverContent(text, forColumn: cell.column)
 
             popover.show(
                 relativeTo: tableView.frameOfCell(atColumn: cell.column, row: cell.row),
                 of: tableView,
                 preferredEdge: .maxY
             )
-            popoverCell = cell
+            previewPopoverCell = cell
         }
 
-        private func updatePopoverContent(_ text: String, forColumn column: Int) {
+        private func updatePreviewPopoverContent(_ text: String, forColumn column: Int) {
             let width = popoverWidth(for: column)
             let height = Self.popoverHeight(for: text)
-            popover?.contentSize = NSSize(width: width, height: height)
-            popoverController.setText(text)
+            if let previewPopover {
+                applyPopoverSize(previewPopover, width: width, height: height)
+            }
+            previewPopoverController.setText(text)
         }
 
-        private func closePopover() {
-            popoverLoadTask?.cancel()
-            popoverLoadTask = nil
-            popoverRequestID = nil
-            popoverCell = nil
+        private func showEditorPopover(
+            for cell: (row: Int, column: Int),
+            descriptor: ColumnEditDescriptor,
+            originalValue: String?,
+            currentValue: String?,
+            errorMessage: String?,
+            isSaving: Bool
+        ) {
+            guard let tableView,
+                  rows.indices.contains(cell.row),
+                  columns.indices.contains(cell.column),
+                  let columnName = columns[safe: cell.column],
+                  let rowItem = rows[safe: cell.row] else {
+                return
+            }
+
+            let popover = makeEditorPopoverIfNeeded()
+            editorPopoverController.render(
+                title: columnName,
+                descriptor: descriptor,
+                originalValue: originalValue,
+                currentValue: currentValue,
+                errorMessage: errorMessage,
+                isSaving: isSaving,
+                onSave: { [weak self] newValue in
+                    self?.commitEditorValue(for: cell, rowItem: rowItem, columnName: columnName, value: newValue)
+                },
+                onCancel: { [weak self] in
+                    self?.closeEditorPopover()
+                }
+            )
+
+            let width = popoverWidth(for: cell.column)
+            let preferredHeight = Self.editorPopoverHeight(descriptor: descriptor, value: currentValue ?? "")
+            let placement = editorPopoverPlacement(for: cell, preferredHeight: preferredHeight)
+            applyPopoverSize(popover, width: width, height: placement.height)
+            if !popover.isShown {
+                popover.show(
+                    relativeTo: tableView.frameOfCell(atColumn: cell.column, row: cell.row),
+                    of: tableView,
+                    preferredEdge: placement.edge
+                )
+            }
+            editorPopoverCell = cell
+        }
+
+        private func applyPopoverSize(_ popover: NSPopover, width: CGFloat, height: CGFloat) {
+            let size = NSSize(width: width, height: height)
+            popover.contentSize = size
+            popover.contentViewController?.preferredContentSize = size
+
+            // Re-apply after presentation to avoid occasional stale cached size from prior openings.
+            DispatchQueue.main.async { [weak popover] in
+                guard let popover, popover.isShown else { return }
+                popover.contentSize = size
+                popover.contentViewController?.preferredContentSize = size
+            }
+        }
+
+        private func commitEditorValue(
+            for cell: (row: Int, column: Int),
+            rowItem: TableRowItem,
+            columnName: String,
+            value: String?
+        ) {
+            guard let descriptor = editDescriptor(for: cell.column),
+                  let onCommitEdit else {
+                return
+            }
+
+            let formattedValue = value.map { Self.unformatEditorValue($0, descriptor: descriptor) }
+            showEditorPopover(
+                for: cell,
+                descriptor: descriptor,
+                originalValue: editorOriginalValue,
+                currentValue: value,
+                errorMessage: nil,
+                isSaving: true
+            )
+
+            editorSaveTask?.cancel()
+            editorSaveTask = Task { [weak self] in
+                guard let self else { return }
+                let result = await onCommitEdit(rowItem, columnName, formattedValue)
+                await MainActor.run {
+                    switch result {
+                    case .success:
+                        self.closeEditorPopover()
+                    case .failure(let message):
+                        self.showEditorPopover(
+                            for: cell,
+                            descriptor: descriptor,
+                            originalValue: self.editorOriginalValue,
+                            currentValue: value,
+                            errorMessage: message,
+                            isSaving: false
+                        )
+                    }
+                }
+            }
+        }
+
+        private func closePreviewPopover() {
+            previewLoadTask?.cancel()
+            previewLoadTask = nil
+            previewRequestID = nil
+            previewPopoverCell = nil
+            let popover = previewPopover
+            previewPopover = nil
             popover?.performClose(nil)
         }
 
-        private func makePopoverIfNeeded() -> NSPopover {
-            if let popover {
-                return popover
+        private func closeEditorPopover() {
+            editorLoadTask?.cancel()
+            editorSaveTask?.cancel()
+            editorLoadTask = nil
+            editorSaveTask = nil
+            editorPopoverCell = nil
+            editorOriginalValue = nil
+            let popover = editorPopover
+            editorPopover = nil
+            popover?.performClose(nil)
+        }
+
+        private func makePreviewPopoverIfNeeded() -> NSPopover {
+            if let previewPopover {
+                return previewPopover
             }
 
             let popover = NSPopover()
             popover.behavior = .transient
             popover.animates = true
-            popover.contentViewController = popoverController
+            popover.contentViewController = previewPopoverController
             popover.delegate = self
-            self.popover = popover
+            self.previewPopover = popover
+            return popover
+        }
+
+        private func makeEditorPopoverIfNeeded() -> NSPopover {
+            if let editorPopover {
+                return editorPopover
+            }
+
+            let popover = NSPopover()
+            popover.behavior = .transient
+            popover.animates = true
+            popover.contentViewController = editorPopoverController
+            popover.delegate = self
+            self.editorPopover = popover
             return popover
         }
 
         private func popoverWidth(for column: Int) -> CGFloat {
             let baseWidth = tableView?.tableColumns[safe: column].map(\.width) ?? DataGridMetrics.defaultColumnWidth
             let proposed = baseWidth * 2.2
-            return min(max(DataGridMetrics.popoverMinWidth, proposed), DataGridMetrics.popoverMaxWidth)
+            let windowWidthLimit = tableView?.window.map { window in
+                max(240, window.contentLayoutRect.width - (DataGridMetrics.popoverWindowPadding * 2))
+            } ?? DataGridMetrics.popoverMaxWidth
+            let maxWidth = min(DataGridMetrics.popoverMaxWidth, windowWidthLimit)
+            let minWidth = min(DataGridMetrics.popoverMinWidth, maxWidth)
+            return min(max(minWidth, proposed), maxWidth)
+        }
+
+        private func editorPopoverPlacement(
+            for cell: (row: Int, column: Int),
+            preferredHeight: CGFloat
+        ) -> (edge: NSRectEdge, height: CGFloat) {
+            guard let tableView,
+                  let window = tableView.window else {
+                return (.maxY, preferredHeight)
+            }
+
+            let cellRect = tableView.frameOfCell(atColumn: cell.column, row: cell.row)
+            let cellRectInWindow = tableView.convert(cellRect, to: nil)
+            let layoutRect = window.contentLayoutRect.insetBy(dx: 0, dy: DataGridMetrics.popoverWindowPadding)
+            let availableAbove = max(0, layoutRect.maxY - cellRectInWindow.maxY)
+            let availableBelow = max(0, cellRectInWindow.minY - layoutRect.minY)
+            return Self.responsivePopoverPlacement(
+                preferredHeight: preferredHeight,
+                availableAbove: availableAbove,
+                availableBelow: availableBelow
+            )
         }
 
         private func isCellVisuallyClipped(row: Int, column: Int, text: String) -> Bool {
@@ -705,6 +1304,40 @@ extension DataGridView {
             return prettyValue
         }
 
+        static func formatEditorValue(_ value: String, descriptor: ColumnEditDescriptor) -> String {
+            switch descriptor.editorKind {
+            case .boolean:
+                let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if ["t", "1"].contains(normalized) {
+                    return "true"
+                }
+                if ["f", "0"].contains(normalized) {
+                    return "false"
+                }
+                return normalized
+            case .textArea where descriptor.typeName == "json" || descriptor.typeName == "jsonb":
+                return formatPopoverValue(value, columnTypeName: descriptor.typeName)
+            case .enumeration, .textArea, .textField:
+                return value
+            }
+        }
+
+        static func unformatEditorValue(_ value: String, descriptor: ColumnEditDescriptor) -> String {
+            switch descriptor.editorKind {
+            case .boolean:
+                let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if ["t", "1"].contains(normalized) {
+                    return "true"
+                }
+                if ["f", "0"].contains(normalized) {
+                    return "false"
+                }
+                return normalized
+            case .enumeration, .textArea, .textField:
+                return value
+            }
+        }
+
         static func popoverHeight(
             for value: String,
             font: NSFont = Coordinator.cellFont,
@@ -716,6 +1349,42 @@ extension DataGridView {
             let textHeight = CGFloat(lineCount) * lineHeight
             let paddedHeight = textHeight + 24
             return min(max(minHeight, paddedHeight), maxHeight)
+        }
+
+        static func editorPopoverHeight(descriptor: ColumnEditDescriptor, value: String) -> CGFloat {
+            switch descriptor.editorKind {
+            case .textArea:
+                return min(max(280, popoverHeight(for: value) + 112), DataGridMetrics.popoverMaxHeight)
+            case .enumeration:
+                return 156
+            case .boolean, .textField:
+                return 142
+            }
+        }
+
+        static func responsivePopoverPlacement(
+            preferredHeight: CGFloat,
+            availableAbove: CGFloat,
+            availableBelow: CGFloat
+        ) -> (edge: NSRectEdge, height: CGFloat) {
+            let edge: NSRectEdge
+            let availableHeight: CGFloat
+            if availableBelow >= availableAbove {
+                edge = .maxY
+                availableHeight = availableBelow
+            } else {
+                edge = .minY
+                availableHeight = availableAbove
+            }
+
+            let usableHeight = max(0, availableHeight - DataGridMetrics.popoverArrowClearance)
+            guard usableHeight > 0 else {
+                return (edge, min(preferredHeight, DataGridMetrics.popoverMaxHeight))
+            }
+
+            let minHeight = min(DataGridMetrics.popoverMinHeight, usableHeight)
+            let height = max(minHeight, min(preferredHeight, usableHeight))
+            return (edge, height)
         }
     }
 }

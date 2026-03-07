@@ -22,6 +22,7 @@ struct DatabaseHeaderChipView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .fixedSize(horizontal: true, vertical: false)
 
         if showsBackground {
             content

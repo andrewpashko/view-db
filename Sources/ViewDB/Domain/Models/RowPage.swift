@@ -1,12 +1,12 @@
 import Foundation
 
-enum RowPageDirection: String, Sendable {
+enum RowPageDirection: String, Equatable, Sendable {
     case initial
     case next
     case previous
 }
 
-enum RowPagingStrategy: String, Sendable {
+enum RowPagingStrategy: String, Equatable, Sendable {
     case offset
     case keysetID
     case keysetPrimaryKey
@@ -114,10 +114,49 @@ struct TableCellValue: Hashable, Sendable {
     let isTruncated: Bool
 }
 
+struct RowEditKey: Hashable, Sendable {
+    let columnName: String
+    let value: String
+    let typeName: String
+}
+
+struct RowEditLocator: Hashable, Sendable {
+    let keys: [RowEditKey]
+
+    var isEmpty: Bool {
+        keys.isEmpty
+    }
+}
+
+enum ColumnEditorKind: Hashable, Sendable {
+    case textField
+    case textArea
+    case boolean
+    case enumeration(options: [String])
+}
+
+struct ColumnEditDescriptor: Hashable, Sendable {
+    let columnName: String
+    let typeName: String
+    let isEditable: Bool
+    let isNullable: Bool
+    let hasDefaultValue: Bool
+    let isGenerated: Bool
+    let editorKind: ColumnEditorKind
+}
+
 struct TableRowItem: Identifiable, Hashable {
     let id: Int
     let identity: RowIdentity
     let values: [TableCellValue]
+    let editLocator: RowEditLocator?
+
+    init(id: Int, identity: RowIdentity, values: [TableCellValue], editLocator: RowEditLocator? = nil) {
+        self.id = id
+        self.identity = identity
+        self.values = values
+        self.editLocator = editLocator
+    }
 }
 
 struct RowPagePreview: Sendable {

@@ -137,6 +137,101 @@ final class PostgresRepositoryPagingTests: XCTestCase {
         XCTAssertEqual(plan, .offset(9, sort: nil))
     }
 
+    func testMakeRowEditLocatorUsesPrimaryKeyValues() {
+        let locator = PostgresRepository.makeRowEditLocator(
+            row: ["42", "demo"],
+            columns: [
+                (name: "id", udtName: "int8"),
+                (name: "name", udtName: "text"),
+            ],
+            primaryKeyColumns: ["id"],
+            relationKind: "r"
+        )
+
+        XCTAssertEqual(
+            locator,
+            RowEditLocator(keys: [
+                RowEditKey(columnName: "id", value: "42", typeName: "int8"),
+            ])
+        )
+    }
+
+    func testMakeRowEditLocatorSupportsCompositePrimaryKeys() {
+        let locator = PostgresRepository.makeRowEditLocator(
+            row: ["eu", "42", "demo"],
+            columns: [
+                (name: "region", udtName: "text"),
+                (name: "id", udtName: "int8"),
+                (name: "name", udtName: "text"),
+            ],
+            primaryKeyColumns: ["region", "id"],
+            relationKind: "r"
+        )
+
+        XCTAssertEqual(
+            locator,
+            RowEditLocator(keys: [
+                RowEditKey(columnName: "region", value: "eu", typeName: "text"),
+                RowEditKey(columnName: "id", value: "42", typeName: "int8"),
+            ])
+        )
+    }
+
+    func testMakeRowEditLocatorRejectsViews() {
+        let locator = PostgresRepository.makeRowEditLocator(
+            row: ["42"],
+            columns: [(name: "id", udtName: "int8")],
+            primaryKeyColumns: ["id"],
+            relationKind: "v"
+        )
+
+        XCTAssertNil(locator)
+    }
+
+    func testMakeColumnEditDescriptorUsesEnumPicker() {
+        let descriptor = PostgresRepository.makeColumnEditDescriptor(
+            columnName: "status",
+            typeName: "order_status",
+            enumOptions: ["draft", "paid"],
+            isNullable: false,
+            hasDefaultValue: true,
+            isGenerated: false,
+            isUpdatable: true,
+            relationKind: "r"
+        )
+
+        XCTAssertEqual(descriptor.editorKind, .enumeration(options: ["draft", "paid"]))
+        XCTAssertTrue(descriptor.isEditable)
+    }
+
+    func testMakeColumnEditDescriptorRejectsGeneratedColumns() {
+        let descriptor = PostgresRepository.makeColumnEditDescriptor(
+            columnName: "slug",
+            typeName: "text",
+            isNullable: false,
+            hasDefaultValue: false,
+            isGenerated: true,
+            isUpdatable: false,
+            relationKind: "r"
+        )
+
+        XCTAssertFalse(descriptor.isEditable)
+    }
+
+    func testMakeColumnEditDescriptorRejectsByteaColumns() {
+        let descriptor = PostgresRepository.makeColumnEditDescriptor(
+            columnName: "payload",
+            typeName: "bytea",
+            isNullable: true,
+            hasDefaultValue: false,
+            isGenerated: false,
+            isUpdatable: true,
+            relationKind: "r"
+        )
+
+        XCTAssertFalse(descriptor.isEditable)
+    }
+
     func testExplicitSortAcceptsNumericType() {
         XCTAssertTrue(PostgresRepository.isExplicitlySortableType("int8"))
     }

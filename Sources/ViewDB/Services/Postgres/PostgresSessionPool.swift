@@ -7,6 +7,7 @@ actor PostgresSessionPool {
         let endpointKey: String
         let database: String
         let username: String
+        let readOnly: Bool
     }
 
     private struct ManagedConnection {
@@ -18,6 +19,7 @@ actor PostgresSessionPool {
     private var nextConnectionID: Int = 1
     private let logger = Logger(label: "com.viewdb.postgres")
     private var connections: [ConnectionKey: ManagedConnection] = [:]
+    private var pendingConnections: [ConnectionKey: Task<PostgresConnection, Error>] = [:]
     private let idleConnectionTTL: TimeInterval = 90
 
     init(credentialsStore: CredentialsStore) {
@@ -37,13 +39,14 @@ actor PostgresSessionPool {
     func withConnection<Value: Sendable>(
         instance: DiscoveredInstance,
         database: String,
+        readOnly: Bool = true,
         operation: @Sendable (PostgresConnection, Logger) async throws -> Value
     ) async throws -> Value {
         let credential = await credentialsStore.credential(for: instance.endpointKey)
         let fallbackUser = instance.defaultUser ?? ProcessInfo.processInfo.environment["USER"] ?? "postgres"
         let username = credential?.username ?? fallbackUser
         let password = credential?.password ?? instance.defaultPassword
-        let key = ConnectionKey(endpointKey: instance.endpointKey, database: database, username: username)
+        let key = ConnectionKey(endpointKey: instance.endpointKey, database: database, username: username, readOnly: readOnly)
 
         do {
             await evictIdleConnections()
@@ -53,8 +56,10 @@ actor PostgresSessionPool {
                 instance: instance,
                 database: database,
                 username: username,
-                password: password
+                password: password,
+                readOnly: readOnly
             )
+            try Task.checkCancellation()
 
             do {
                 let value = try await operation(connection, logger)
@@ -68,7 +73,8 @@ actor PostgresSessionPool {
                         instance: instance,
                         database: database,
                         username: username,
-                        password: password
+                        password: password,
+                        readOnly: readOnly
                     )
 
                     let value = try await operation(freshConnection, logger)
@@ -99,7 +105,8 @@ actor PostgresSessionPool {
         instance: DiscoveredInstance,
         database: String,
         username: String,
-        password: String?
+        password: String?,
+        readOnly: Bool
     ) async throws -> PostgresConnection {
         if let existing = connections[key] {
             if existing.connection.isClosed {
@@ -110,6 +117,29 @@ actor PostgresSessionPool {
             }
         }
 
+        if let pending = pendingConnections[key] {
+            let result = await pending.result
+            switch result {
+            case .success(let connection):
+                if connection.isClosed {
+                    pendingConnections.removeValue(forKey: key)
+                    return try await resolveConnection(
+                        key: key,
+                        instance: instance,
+                        database: database,
+                        username: username,
+                        password: password,
+                        readOnly: readOnly
+                    )
+                }
+                markConnectionUsed(for: key)
+                return connection
+            case .failure(let error):
+                pendingConnections.removeValue(forKey: key)
+                throw error
+            }
+        }
+
         let configuration = makeConfiguration(
             instance: instance,
             username: username,
@@ -117,16 +147,47 @@ actor PostgresSessionPool {
             database: database
         )
         let connectionID = allocateConnectionID()
-        let connection = try await PostgresConnection.connect(
-            configuration: configuration,
-            id: connectionID,
-            logger: logger
-        )
-        _ = try await connection.query("SET default_transaction_read_only = on", logger: logger)
-        _ = try await connection.query("SET statement_timeout = '15s'", logger: logger)
+        let task = Task.detached(priority: nil) { [logger] in
+            let connection = try await PostgresConnection.connect(
+                configuration: configuration,
+                id: connectionID,
+                logger: logger
+            )
+            do {
+                let readOnlyQuery = readOnly
+                    ? "SET default_transaction_read_only = on"
+                    : "SET default_transaction_read_only = off"
+                _ = try await connection.query(PostgresQuery(unsafeSQL: readOnlyQuery), logger: logger).collect()
+                _ = try await connection.query("SET statement_timeout = '15s'", logger: logger).collect()
+                return connection
+            } catch {
+                if !connection.isClosed {
+                    try? await connection.closeGracefully()
+                }
+                throw error
+            }
+        }
+        pendingConnections[key] = task
 
-        connections[key] = ManagedConnection(connection: connection, lastUsedAt: Date())
-        return connection
+        let result = await task.result
+        pendingConnections.removeValue(forKey: key)
+
+        switch result {
+        case .success(let connection):
+            if let existing = connections[key],
+               !existing.connection.isClosed {
+                if existing.connection !== connection {
+                    try? await connection.closeGracefully()
+                }
+                markConnectionUsed(for: key)
+                return existing.connection
+            }
+
+            connections[key] = ManagedConnection(connection: connection, lastUsedAt: Date())
+            return connection
+        case .failure(let error):
+            throw error
+        }
     }
 
     private func markConnectionUsed(for key: ConnectionKey) {

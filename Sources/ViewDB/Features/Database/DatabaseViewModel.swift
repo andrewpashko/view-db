@@ -17,6 +17,7 @@ final class DatabaseViewModel {
     private let instanceLookup: any InstanceLookupService
     private let catalogService: any CatalogService
     private let queryService: any QueryService
+    private let cellEditingService: any CellEditingService
     private let credentialService: any CredentialService
 
     private(set) var instance: DiscoveredInstance?
@@ -33,6 +34,7 @@ final class DatabaseViewModel {
     }
     private(set) var tableRows: [TableRowItem] = []
     private(set) var sqlRows: [TableRowItem] = []
+    private(set) var columnEditDescriptors: [ColumnEditDescriptor] = []
     private(set) var totalRowCount: Int?
     private(set) var activeSort: TableSort?
 
@@ -64,6 +66,7 @@ final class DatabaseViewModel {
     private var tableTask: Task<Void, Never>?
     private var sqlTask: Task<Void, Never>?
     private var countTask: Task<Void, Never>?
+    private var editMetadataTask: Task<Void, Never>?
     private let logger = Logger(label: "com.viewdb.ui.database")
     private let previewLimitChars = 256
 
@@ -72,12 +75,14 @@ final class DatabaseViewModel {
         instanceLookup: any InstanceLookupService,
         catalogService: any CatalogService,
         queryService: any QueryService,
+        cellEditingService: any CellEditingService,
         credentialService: any CredentialService
     ) {
         self.database = database
         self.instanceLookup = instanceLookup
         self.catalogService = catalogService
         self.queryService = queryService
+        self.cellEditingService = cellEditingService
         self.credentialService = credentialService
     }
 
@@ -112,6 +117,7 @@ final class DatabaseViewModel {
         guard selectedTable != table else { return }
         selectedTable = table
         activeSort = nil
+        loadEditMetadata(for: table)
         fetchRows(
             request: RowPageRequest(
                 limit: rowsPerPage,
@@ -249,6 +255,58 @@ final class DatabaseViewModel {
         }
     }
 
+    func beginCellEdit(row: TableRowItem, columnName: String) async -> String? {
+        guard let selectedTable,
+              let rowLocator = row.editLocator else {
+            return nil
+        }
+
+        if let descriptor = editDescriptor(named: columnName),
+           !descriptor.isEditable {
+            return nil
+        }
+
+        do {
+            return try await cellEditingService.fetchEditableCellValue(
+                database: database,
+                table: selectedTable,
+                rowLocator: rowLocator,
+                columnName: columnName
+            )
+        } catch {
+            let message = PostgresErrorClassifier.message(for: error)
+            errorMessage = message
+            logger.debug("beginCellEdit failed: \(String(describing: error))")
+            return nil
+        }
+    }
+
+    func saveCellEdit(row: TableRowItem, columnName: String, value: String?) async -> DataGridView.CommitEditOutcome {
+        guard let selectedTable,
+              let rowLocator = row.editLocator else {
+            let message = "The selected row cannot be edited."
+            errorMessage = message
+            return .failure(message)
+        }
+
+        do {
+            let savedValue = try await cellEditingService.updateCell(
+                database: database,
+                table: selectedTable,
+                rowLocator: rowLocator,
+                columnName: columnName,
+                value: value
+            )
+            patchCell(rowID: row.id, columnName: columnName, value: savedValue)
+            refreshCurrentPageAfterEdit()
+            return .success(savedValue)
+        } catch {
+            let message = PostgresErrorClassifier.message(for: error)
+            errorMessage = message
+            return .failure(message)
+        }
+    }
+
     func submitCredentials(_ credentials: ConnectionCredentials) {
         guard let instance else { return }
 
@@ -273,6 +331,7 @@ final class DatabaseViewModel {
     private func loadTablesImpl() async {
         isLoadingTables = true
         errorMessage = nil
+        defer { isLoadingTables = false }
 
         let resolvedInstance: DiscoveredInstance?
         if let existing = instance {
@@ -282,7 +341,6 @@ final class DatabaseViewModel {
         }
 
         guard let resolvedInstance else {
-            isLoadingTables = false
             errorMessage = AppError.noEndpoint.errorDescription
             return
         }
@@ -297,6 +355,7 @@ final class DatabaseViewModel {
             if let selectedTable,
                let match = tables.first(where: { $0.id == selectedTable.id }) {
                 self.selectedTable = match
+                loadEditMetadata(for: match)
                 fetchRows(
                     request: RowPageRequest(
                         limit: rowsPerPage,
@@ -309,6 +368,7 @@ final class DatabaseViewModel {
             } else if let first = tables.first {
                 selectedTable = first
                 activeSort = nil
+                loadEditMetadata(for: first)
                 fetchRows(
                     request: RowPageRequest(
                         limit: rowsPerPage,
@@ -320,6 +380,7 @@ final class DatabaseViewModel {
                 )
             } else {
                 rowPage = .empty
+                columnEditDescriptors = []
                 totalRowCount = nil
                 isLoadingCount = false
                 activeSort = nil
@@ -327,13 +388,12 @@ final class DatabaseViewModel {
         } catch {
             handle(error: error, instance: resolvedInstance, forSQL: false)
         }
-
-        isLoadingTables = false
     }
 
     private func fetchRows(request: RowPageRequest, refreshCount: Bool = false) {
         guard let selectedTable else {
             rowPage = .empty
+            columnEditDescriptors = []
             totalRowCount = nil
             isLoadingCount = false
             return
@@ -460,6 +520,57 @@ final class DatabaseViewModel {
         return max(1, rowPage.limit == 0 ? fallback : rowPage.limit)
     }
 
+    private func loadEditMetadata(for table: TableRef) {
+        editMetadataTask?.cancel()
+        editMetadataTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let descriptors = try await self.cellEditingService.fetchEditMetadata(
+                    database: self.database,
+                    table: table
+                )
+                if Task.isCancelled { return }
+                guard self.selectedTable?.id == table.id else { return }
+                self.columnEditDescriptors = descriptors
+            } catch {
+                if Task.isCancelled { return }
+                guard self.selectedTable?.id == table.id else { return }
+                self.columnEditDescriptors = []
+                self.logger.debug("edit metadata failed: \(String(describing: error))")
+            }
+        }
+    }
+
+    private func editDescriptor(named columnName: String) -> ColumnEditDescriptor? {
+        columnEditDescriptors.first(where: { $0.columnName == columnName })
+    }
+
+    private func patchCell(rowID: Int, columnName: String, value: String) {
+        guard let rowIndex = tableRows.firstIndex(where: { $0.id == rowID }),
+              let columnIndex = rowPage.columns.firstIndex(of: columnName) else {
+            return
+        }
+
+        var row = tableRows[rowIndex]
+        var values = row.values
+        guard values.indices.contains(columnIndex) else { return }
+        values[columnIndex] = PostgresRepository.makePreviewCellValue(value: value, maxChars: previewLimitChars)
+        row = TableRowItem(id: row.id, identity: row.identity, values: values, editLocator: row.editLocator)
+        tableRows[rowIndex] = row
+    }
+
+    private func refreshCurrentPageAfterEdit() {
+        guard selectedTable != nil else { return }
+        fetchRows(
+            request: RowPageRequest(
+                limit: rowsPerPage,
+                direction: .initial,
+                offset: rowPage.offset,
+                sort: activeSort
+            )
+        )
+    }
+
     private static func makeRowPageMetadata(from preview: RowPagePreview) -> RowPage {
         RowPage(
             columns: preview.columns,
@@ -483,7 +594,8 @@ final class DatabaseViewModel {
             return TableRowItem(
                 id: page.offset + offset,
                 identity: .offset(page.offset + offset, sort: page.sort),
-                values: cellValues
+                values: cellValues,
+                editLocator: nil
             )
         }
     }

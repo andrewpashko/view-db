@@ -5,6 +5,7 @@ struct DatabaseView: View {
     let environment: AppEnvironment
 
     @State private var viewModel: DatabaseViewModel
+    @FocusState private var isTableSearchFocused: Bool
 
     init(database: DatabaseRef, environment: AppEnvironment) {
         self.database = database
@@ -14,6 +15,7 @@ struct DatabaseView: View {
             instanceLookup: environment.discoveryCoordinator,
             catalogService: environment.catalogService,
             queryService: environment.queryService,
+            cellEditingService: environment.cellEditingService,
             credentialService: environment.postgresRepository
         ))
     }
@@ -24,6 +26,11 @@ struct DatabaseView: View {
         } detail: {
             detail
         }
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                isTableSearchFocused = false
+            }
+        )
         .navigationTitle(database.name)
         .toolbar(removing: .title)
         .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
@@ -31,9 +38,8 @@ struct DatabaseView: View {
             ToolbarItem(placement: .principal) {
                 toolbarTitleLabel
             }
-            ToolbarItemGroup(placement: .primaryAction) {
-                runSQLButton
-                refreshButton
+            ToolbarItem(placement: .primaryAction) {
+                toolbarActions
             }
         }
         .sheet(isPresented: $viewModel.isSQLSheetPresented) {
@@ -43,7 +49,10 @@ struct DatabaseView: View {
                 rows: viewModel.sqlRows,
                 isRunning: viewModel.isRunningSQL,
                 errorMessage: viewModel.sqlErrorMessage,
-                onRun: viewModel.runSQL
+                onRun: viewModel.runSQL,
+                onClose: {
+                    viewModel.isSQLSheetPresented = false
+                }
             )
         }
         .sheet(item: $viewModel.credentialPrompt) { state in
@@ -62,10 +71,7 @@ struct DatabaseView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 10) {
-            TextField("Search tables", text: $viewModel.tableSearch)
-                .textFieldStyle(.roundedBorder)
-                .padding(.horizontal, 12)
-                .padding(.top, 12)
+            tableSearchField
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
@@ -109,12 +115,58 @@ struct DatabaseView: View {
                 Text(errorMessage)
                     .font(.caption)
                     .foregroundStyle(.orange)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 12)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
             }
         }
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                isTableSearchFocused = false
+            }
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .navigationSplitViewColumnWidth(min: 240, ideal: 280)
+    }
+
+    private var tableSearchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .font(.system(size: 16, weight: .semibold))
+
+            TextField("Search tables", text: $viewModel.tableSearch)
+                .textFieldStyle(.plain)
+                .focused($isTableSearchFocused)
+                .onSubmit {
+                    isTableSearchFocused = false
+                }
+
+            if !viewModel.tableSearch.isEmpty {
+                Button {
+                    viewModel.tableSearch = ""
+                    isTableSearchFocused = true
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 44)
+        .frame(maxWidth: .infinity)
+        .viewDBGlassCard(interactive: true, cornerRadius: 22)
+        .overlay(
+            RoundedRectangle(cornerRadius: 22)
+                .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            isTableSearchFocused = true
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
     }
 
     private var detail: some View {
@@ -139,7 +191,7 @@ struct DatabaseView: View {
             if viewModel.selectedTable != nil {
                 pagingControls
                     .padding(.horizontal, 16)
-                    .padding(.bottom, 16)
+                    .padding(.bottom, 12)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -147,26 +199,27 @@ struct DatabaseView: View {
 
     private var toolbarTitleLabel: some View {
         HStack(spacing: 8) {
+            Color.clear
+                .frame(width: 18, height: 14)
+                .accessibilityHidden(true)
+
             Image(systemName: "cylinder.split.1x2")
                 .font(.headline)
             Text(database.name)
                 .font(.headline.weight(.semibold))
                 .lineLimit(1)
+                .truncationMode(.middle)
 
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Loading…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(width: 86, alignment: .leading)
-            .opacity(viewModel.isLoadingTables ? 1 : 0)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Loading tables")
-            .accessibilityHidden(!viewModel.isLoadingTables)
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 14, height: 14)
+                .padding(.horizontal, 2)
+                .opacity(viewModel.isLoadingTables ? 1 : 0)
+                .accessibilityLabel("Loading tables")
+                .accessibilityHidden(!viewModel.isLoadingTables)
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 16)
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     @ViewBuilder
@@ -206,6 +259,7 @@ struct DatabaseView: View {
                 TableGridSection(
                     columns: viewModel.rowPage.columns,
                     columnTypeNames: viewModel.rowPage.columnTypeNames,
+                    columnEditDescriptors: viewModel.columnEditDescriptors,
                     rows: viewModel.tableRows,
                     activeSort: viewModel.activeSort,
                     sortableColumns: viewModel.sortableColumns,
@@ -214,6 +268,12 @@ struct DatabaseView: View {
                     },
                     onRequestFullValue: { rowIdentity, columnName in
                         await viewModel.fetchFullCellValue(rowIdentity: rowIdentity, columnName: columnName)
+                    },
+                    onBeginEdit: { row, columnName in
+                        await viewModel.beginCellEdit(row: row, columnName: columnName)
+                    },
+                    onCommitEdit: { row, columnName, value in
+                        await viewModel.saveCellEdit(row: row, columnName: columnName, value: value)
                     }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -260,10 +320,17 @@ struct DatabaseView: View {
     }
 
     private var runSQLButton: some View {
-        Button("Run SQL") {
+        Button {
             viewModel.openSQLSheet()
+        } label: {
+            Text("Run SQL")
+                .font(.system(size: 14, weight: .semibold))
+                .padding(.horizontal, 10)
+                .frame(height: 34)
         }
-        .controlSize(.large)
+        .buttonStyle(.plain)
+        .help("Run SQL")
+        .accessibilityLabel("Run SQL")
     }
 
     private var refreshButton: some View {
@@ -271,8 +338,32 @@ struct DatabaseView: View {
             viewModel.refresh()
         } label: {
             Image(systemName: "arrow.clockwise")
+                .font(.system(size: 16, weight: .semibold))
+                .frame(width: 34, height: 34)
+                .contentShape(Circle())
         }
-        .controlSize(.large)
+        .buttonStyle(.plain)
+        .help("Reload")
+        .accessibilityLabel("Reload")
+    }
+
+    private var toolbarActions: some View {
+        HStack(spacing: 0) {
+            runSQLButton
+
+            Rectangle()
+                .fill(Color.secondary.opacity(0.22))
+                .frame(width: 1, height: 26)
+                .padding(.horizontal, 2)
+
+            refreshButton
+        }
+        .padding(.horizontal, 2)
+        .padding(.vertical, 2)
+        .frame(height: 36)
+        .viewDBGlassCard(interactive: true, cornerRadius: 18)
+        .clipShape(.capsule)
+        .fixedSize(horizontal: true, vertical: true)
     }
 
     private var pagingButtons: some View {
@@ -351,21 +442,27 @@ struct DatabaseView: View {
 private struct TableGridSection: View {
     let columns: [String]
     let columnTypeNames: [String]
+    let columnEditDescriptors: [ColumnEditDescriptor]
     let rows: [TableRowItem]
     let activeSort: TableSort?
     let sortableColumns: Set<String>
     let onToggleSort: (String) -> Void
     let onRequestFullValue: DataGridView.FullValueProvider
+    let onBeginEdit: DataGridView.BeginEditValueProvider
+    let onCommitEdit: DataGridView.CommitEditProvider
 
     var body: some View {
         DataGridView(
             columns: columns,
             columnTypeNames: columnTypeNames,
+            columnEditDescriptors: columnEditDescriptors,
             rows: rows,
             activeSort: activeSort,
             sortableColumns: sortableColumns,
             onToggleSort: onToggleSort,
-            onRequestFullValue: onRequestFullValue
+            onRequestFullValue: onRequestFullValue,
+            onBeginEdit: onBeginEdit,
+            onCommitEdit: onCommitEdit
         )
         .transaction { transaction in
             transaction.animation = nil

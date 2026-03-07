@@ -85,6 +85,7 @@ final class HomeViewModel {
     private func loadImpl() async {
         isLoading = true
         errorMessage = nil
+        defer { isLoading = false }
 
         let instances = await discoveryCoordinator.discoverInstances()
 
@@ -119,7 +120,6 @@ final class HomeViewModel {
         allGroups = groups
         trimHiddenDatabaseIDs(keeping: groups)
         visibleGroups = applyFilter(groups, query: searchText)
-        isLoading = false
     }
 
     private func scheduleSearchDebounce() {

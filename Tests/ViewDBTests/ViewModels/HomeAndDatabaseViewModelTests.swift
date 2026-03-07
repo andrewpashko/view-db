@@ -54,10 +54,15 @@ private actor MockInstanceLookupService: InstanceLookupService {
     }
 }
 
-private actor MockQueryService: QueryService {
+private actor MockQueryService: QueryService, CellEditingService {
     private(set) var fetchedTableNames: [String] = []
     private(set) var fetchedRequests: [RowPageRequest] = []
+    private(set) var updatedCells: [(columnName: String, value: String?)] = []
     var rowCountDelayMS: UInt64 = 0
+    var editMetadata: [ColumnEditDescriptor] = []
+    var editableCellValues: [String: String?] = [:]
+    var updateError: Error?
+    var updatedValueOverride: String?
 
     private let initialPreviewPage: RowPagePreview
     private let nextPreviewPage: RowPagePreview
@@ -135,6 +140,33 @@ private actor MockQueryService: QueryService {
         "full-\(columnName)"
     }
 
+    func fetchEditMetadata(database: DatabaseRef, table: TableRef) async throws -> [ColumnEditDescriptor] {
+        editMetadata
+    }
+
+    func fetchEditableCellValue(
+        database: DatabaseRef,
+        table: TableRef,
+        rowLocator: RowEditLocator,
+        columnName: String
+    ) async throws -> String? {
+        editableCellValues[columnName] ?? nil
+    }
+
+    func updateCell(
+        database: DatabaseRef,
+        table: TableRef,
+        rowLocator: RowEditLocator,
+        columnName: String,
+        value: String?
+    ) async throws -> String {
+        if let updateError {
+            throw updateError
+        }
+        updatedCells.append((columnName, value))
+        return updatedValueOverride ?? value ?? "NULL"
+    }
+
     func fetchRowCount(database: DatabaseRef, table: TableRef) async throws -> Int {
         if rowCountDelayMS > 0 {
             try? await Task.sleep(for: .milliseconds(Int(rowCountDelayMS)))
@@ -170,6 +202,26 @@ private actor MockQueryService: QueryService {
 
     func setRowCountDelay(milliseconds: UInt64) {
         rowCountDelayMS = milliseconds
+    }
+
+    func setEditMetadata(_ descriptors: [ColumnEditDescriptor]) {
+        editMetadata = descriptors
+    }
+
+    func setEditableCellValue(_ value: String?, for columnName: String) {
+        editableCellValues[columnName] = value
+    }
+
+    func lastUpdatedCell() -> (columnName: String, value: String?)? {
+        updatedCells.last
+    }
+
+    func setUpdatedValueOverride(_ value: String?) {
+        updatedValueOverride = value
+    }
+
+    func setUpdateError(_ error: Error?) {
+        updateError = error
     }
 }
 
@@ -324,6 +376,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             instanceLookup: lookup,
             catalogService: catalog,
             queryService: query,
+            cellEditingService: query,
             credentialService: credentials
         )
 
@@ -384,6 +437,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             instanceLookup: lookup,
             catalogService: catalog,
             queryService: query,
+            cellEditingService: query,
             credentialService: credentials
         )
 
@@ -478,6 +532,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             instanceLookup: lookup,
             catalogService: catalog,
             queryService: query,
+            cellEditingService: query,
             credentialService: credentials
         )
 
@@ -548,6 +603,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             instanceLookup: lookup,
             catalogService: catalog,
             queryService: query,
+            cellEditingService: query,
             credentialService: credentials
         )
 
@@ -585,6 +641,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             instanceLookup: lookup,
             catalogService: catalog,
             queryService: query,
+            cellEditingService: query,
             credentialService: credentials
         )
 
@@ -642,6 +699,7 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
             instanceLookup: lookup,
             catalogService: catalog,
             queryService: query,
+            cellEditingService: query,
             credentialService: credentials
         )
 
@@ -669,5 +727,122 @@ final class HomeAndDatabaseViewModelTests: XCTestCase {
         XCTAssertEqual(requests[3].direction, .initial)
         XCTAssertEqual(requests[3].offset, 0)
         XCTAssertNil(requests[3].sort)
+    }
+
+    func testDatabaseViewModelLoadsEditMetadataForSelectedTable() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let database = DatabaseRef(instanceID: instance.id, name: "app_db")
+        let table = TableRef(databaseID: database.id, schema: "public", name: "events")
+        let lookup = MockInstanceLookupService(instance: instance)
+        let catalog = MockCatalogService(databaseNames: [database.name], tables: [table])
+        let query = MockQueryService()
+        await query.setEditMetadata([
+            ColumnEditDescriptor(
+                columnName: "name",
+                typeName: "text",
+                isEditable: true,
+                isNullable: false,
+                hasDefaultValue: false,
+                isGenerated: false,
+                editorKind: .textField
+            ),
+        ])
+        let credentials = MockCredentialService()
+
+        let vm = DatabaseViewModel(
+            database: database,
+            instanceLookup: lookup,
+            catalogService: catalog,
+            queryService: query,
+            cellEditingService: query,
+            credentialService: credentials
+        )
+
+        await vm.loadNow()
+        try? await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertEqual(vm.columnEditDescriptors.count, 1)
+        XCTAssertEqual(vm.columnEditDescriptors.first?.columnName, "name")
+    }
+
+    func testDatabaseViewModelSaveCellEditPatchesVisibleCellAndRefetches() async {
+        let instance = DiscoveredInstance(
+            source: .brew,
+            displayName: "Brew PG",
+            host: "localhost",
+            port: 5432,
+            socketPath: nil
+        )
+
+        let database = DatabaseRef(instanceID: instance.id, name: "app_db")
+        let table = TableRef(databaseID: database.id, schema: "public", name: "events")
+        let locator = RowEditLocator(keys: [RowEditKey(columnName: "id", value: "1", typeName: "int8")])
+        let previewPage = RowPagePreview(
+            columns: ["id", "name"],
+            rows: [
+                TableRowItem(
+                    id: 0,
+                    identity: .offset(0),
+                    values: [
+                        TableCellValue(previewText: "1", isTruncated: false),
+                        TableCellValue(previewText: "old", isTruncated: false),
+                    ],
+                    editLocator: locator
+                ),
+            ],
+            limit: 100,
+            offset: 0,
+            hasNext: false,
+            strategy: .offset,
+            sort: nil,
+            nextCursor: nil,
+            previousCursor: nil
+        )
+
+        let lookup = MockInstanceLookupService(instance: instance)
+        let catalog = MockCatalogService(databaseNames: [database.name], tables: [table])
+        let query = MockQueryService(initialPreviewPage: previewPage)
+        await query.setEditMetadata([
+            ColumnEditDescriptor(
+                columnName: "name",
+                typeName: "text",
+                isEditable: true,
+                isNullable: false,
+                hasDefaultValue: false,
+                isGenerated: false,
+                editorKind: .textField
+            ),
+        ])
+        await query.setUpdatedValueOverride("updated")
+        let credentials = MockCredentialService()
+
+        let vm = DatabaseViewModel(
+            database: database,
+            instanceLookup: lookup,
+            catalogService: catalog,
+            queryService: query,
+            cellEditingService: query,
+            credentialService: credentials
+        )
+
+        await vm.loadNow()
+        try? await Task.sleep(for: .milliseconds(150))
+
+        let result = await vm.saveCellEdit(row: vm.tableRows[0], columnName: "name", value: "updated")
+        XCTAssertEqual(result, .success("updated"))
+        XCTAssertEqual(vm.tableRows[0].values[1].previewText, "updated")
+
+        try? await Task.sleep(for: .milliseconds(150))
+        let requests = await query.requests()
+        XCTAssertGreaterThanOrEqual(requests.count, 2)
+        XCTAssertEqual(requests.last?.offset, 0)
+        XCTAssertEqual(requests.last?.direction, .initial)
     }
 }
