@@ -504,7 +504,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
         let safeTable = Self.quoteIdentifier(table.name)
         let safeColumn = Self.quoteIdentifier(columnName)
         let whereClause = Self.makeRowEditWhereClause(rowLocator)
-        let assignedValue = Self.sqlLiteral(for: value)
+        let assignedValue = try Self.sqlAssignmentExpression(for: value, typeName: descriptor.typeName)
         let sql = """
             UPDATE \(safeSchema).\(safeTable)
             SET \(safeColumn) = \(assignedValue)
@@ -1259,12 +1259,17 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
     }
 
     private static func isSupportedEditableType(_ udtName: String, enumOptions: [String]) -> Bool {
-        guard !udtName.hasPrefix("_"),
-              udtName != "bytea" else {
+        guard udtName != "bytea" else {
             return false
         }
         if !enumOptions.isEmpty {
             return true
+        }
+        if ["_json", "_jsonb"].contains(udtName) {
+            return true
+        }
+        guard !udtName.hasPrefix("_") else {
+            return false
         }
 
         let supportedTypes: Set<String> = [
@@ -1285,7 +1290,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
         if typeName == "bool" {
             return .boolean
         }
-        if ["json", "jsonb", "text"].contains(typeName) {
+        if ["json", "jsonb", "text", "_json", "_jsonb"].contains(typeName) {
             return .textArea
         }
         return .textField
@@ -1314,6 +1319,21 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
         return "'\(escapeSQLLiteral(value))'"
     }
 
+    static func sqlAssignmentExpression(for value: String?, typeName: String) throws -> String {
+        guard let value else {
+            return "NULL"
+        }
+
+        switch typeName {
+        case "_jsonb":
+            return try jsonArrayAssignmentExpression(rawValue: value, elementType: "jsonb")
+        case "_json":
+            return try jsonArrayAssignmentExpression(rawValue: value, elementType: "json")
+        default:
+            return sqlLiteral(for: value)
+        }
+    }
+
     private static func makeRowEditWhereClause(_ rowLocator: RowEditLocator) -> String {
         rowLocator.keys
             .map { "\(quoteIdentifier($0.columnName)) = \(sqlLiteral(for: $0.value))" }
@@ -1324,7 +1344,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
         value.replacingOccurrences(of: "'", with: "''")
     }
 
-    private static func displayValue(_ cell: PostgresCell) -> String {
+    static func displayValue(_ cell: PostgresCell) -> String {
         guard cell.bytes != nil else {
             return "NULL"
         }
@@ -1340,8 +1360,13 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
             return (try? cell.decode(Int64.self)).map(String.init) ?? rawValue(cell)
         case .float4:
             return (try? cell.decode(Float.self)).map { "\($0)" } ?? rawValue(cell)
-        case .float8, .numeric:
+        case .float8:
             return (try? cell.decode(Double.self)).map { "\($0)" } ?? rawValue(cell)
+        case .numeric:
+            if let decimal = try? cell.decode(Decimal.self) {
+                return NSDecimalNumber(decimal: decimal).stringValue
+            }
+            return rawValue(cell)
         case .uuid:
             return (try? cell.decode(UUID.self)).map { $0.uuidString } ?? rawValue(cell)
         case .date, .time, .timetz, .timestamp, .timestamptz:
@@ -1349,8 +1374,21 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
                 return iso8601Formatter.string(from: date)
             }
             return rawValue(cell)
+        case .jsonArray, .jsonbArray:
+            if let jsonArray = decodedJSONArray(cell) {
+                return jsonArray
+            }
+            return rawValue(cell)
+        case .textArray, .varcharArray, .bpcharArray, .nameArray:
+            if let values = try? cell.decode([String].self) {
+                return formatPostgresTextArray(values)
+            }
+            return rawValue(cell)
+        case .text, .varchar, .bpchar, .name, .json, .jsonb:
+            return (try? cell.decode(String.self)) ?? rawValue(cell)
         default:
-            if let text = try? cell.decode(String.self) {
+            if cell.format == .text,
+               let text = try? cell.decode(String.self) {
                 return text
             }
             return rawValue(cell)
@@ -1368,13 +1406,75 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
         guard var bytes = cell.bytes else {
             return "NULL"
         }
-        if let string = bytes.readString(length: bytes.readableBytes), !string.isEmpty {
+        if cell.format == .text,
+           let string = bytes.readString(length: bytes.readableBytes), !string.isEmpty {
             return string
         }
 
         bytes.moveReaderIndex(to: 0)
         let hex = bytes.readableBytesView.map { String(format: "%02hhx", $0) }.joined()
         return hex.isEmpty ? "" : "0x\(hex)"
+    }
+
+    private static func decodedJSONArray(_ cell: PostgresCell) -> String? {
+        guard let values = try? cell.decode([String].self) else {
+            return nil
+        }
+
+        var objects: [Any] = []
+        objects.reserveCapacity(values.count)
+        for value in values {
+            guard let data = value.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data, options: []) else {
+                return formatPostgresTextArray(values)
+            }
+            objects.append(object)
+        }
+
+        guard let prettyData = try? JSONSerialization.data(
+            withJSONObject: objects,
+            options: [.prettyPrinted, .sortedKeys]
+        ),
+        let prettyValue = String(data: prettyData, encoding: .utf8) else {
+            return formatPostgresTextArray(values)
+        }
+
+        return prettyValue
+    }
+
+    private static func formatPostgresTextArray(_ values: [String]) -> String {
+        let escaped = values.map { value in
+            let withEscapedBackslashes = value.replacingOccurrences(of: "\\", with: "\\\\")
+            let withEscapedQuotes = withEscapedBackslashes.replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(withEscapedQuotes)\""
+        }
+        return "{\(escaped.joined(separator: ","))}"
+    }
+
+    private static func jsonArrayAssignmentExpression(rawValue: String, elementType: String) throws -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[") {
+            guard let data = trimmed.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data, options: []),
+                  json is [Any] else {
+                throw AppError.queryRejected("Expected a JSON array value for \(elementType)[] columns.")
+            }
+
+            if trimmed == "[]" {
+                return "ARRAY[]::\(elementType)[]"
+            }
+
+            let escaped = escapeSQLLiteral(trimmed)
+            return """
+                COALESCE(
+                    (SELECT array_agg(value::\(elementType)) FROM jsonb_array_elements('\(escaped)'::jsonb) AS t(value)),
+                    ARRAY[]::\(elementType)[]
+                )
+                """
+        }
+
+        // Allow direct PostgreSQL array-literal editing as an advanced path.
+        return "'\(escapeSQLLiteral(rawValue))'::\(elementType)[]"
     }
 
     private static func quoteIdentifier(_ value: String) -> String {

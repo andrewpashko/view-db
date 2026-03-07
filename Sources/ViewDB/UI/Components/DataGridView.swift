@@ -653,17 +653,18 @@ extension DataGridView {
             }
 
             let cellValue = rows[safe: row]?.values[safe: columnIndex]?.previewText ?? ""
+            let displayText = Self.normalizeCellDisplayText(cellValue)
 
             if let existing = tableView.makeView(withIdentifier: Self.cellIdentifier, owner: nil) as? NSTableCellView,
                let textField = existing.textField {
-                textField.stringValue = cellValue
+                textField.stringValue = displayText
                 return existing
             }
 
             let cellView = NSTableCellView()
             cellView.identifier = Self.cellIdentifier
 
-            let textField = NSTextField(labelWithString: cellValue)
+            let textField = NSTextField(labelWithString: displayText)
             textField.font = Self.cellFont
             textField.lineBreakMode = .byTruncatingTail
             textField.maximumNumberOfLines = 1
@@ -1286,6 +1287,15 @@ extension DataGridView {
 
             let measuredWidth = (value as NSString).size(withAttributes: [.font: font]).width
             return measuredWidth > availableWidth
+        }
+
+        static func normalizeCellDisplayText(_ value: String) -> String {
+            let normalizedNewlines = value
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+            return normalizedNewlines
+                .replacingOccurrences(of: "\n", with: " ↩ ")
+                .replacingOccurrences(of: "\t", with: "    ")
         }
 
         static func formatPopoverValue(_ value: String, columnTypeName: String?) -> String {

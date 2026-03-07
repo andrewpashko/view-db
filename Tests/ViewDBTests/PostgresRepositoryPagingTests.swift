@@ -1,4 +1,6 @@
 import XCTest
+import NIOCore
+import PostgresNIO
 @testable import ViewDB
 
 final class PostgresRepositoryPagingTests: XCTestCase {
@@ -232,6 +234,21 @@ final class PostgresRepositoryPagingTests: XCTestCase {
         XCTAssertFalse(descriptor.isEditable)
     }
 
+    func testMakeColumnEditDescriptorAllowsJSONBArrayColumns() {
+        let descriptor = PostgresRepository.makeColumnEditDescriptor(
+            columnName: "specs_structure",
+            typeName: "_jsonb",
+            isNullable: true,
+            hasDefaultValue: false,
+            isGenerated: false,
+            isUpdatable: true,
+            relationKind: "r"
+        )
+
+        XCTAssertTrue(descriptor.isEditable)
+        XCTAssertEqual(descriptor.editorKind, .textArea)
+    }
+
     func testExplicitSortAcceptsNumericType() {
         XCTAssertTrue(PostgresRepository.isExplicitlySortableType("int8"))
     }
@@ -242,5 +259,73 @@ final class PostgresRepositoryPagingTests: XCTestCase {
 
     func testExplicitSortRejectsArrayType() {
         XCTAssertFalse(PostgresRepository.isExplicitlySortableType("_int4"))
+    }
+
+    func testDisplayValueDecodesBinaryNumericAsDecimalString() {
+        var bytes = ByteBufferAllocator().buffer(capacity: 32)
+        let numeric = Decimal(string: "560.95")!
+        numeric.encode(into: &bytes, context: .default)
+
+        let cell = PostgresCell(
+            bytes: bytes,
+            dataType: .numeric,
+            format: .binary,
+            columnName: "emission_x_count",
+            columnIndex: 0
+        )
+
+        XCTAssertEqual(PostgresRepository.displayValue(cell), "560.95")
+    }
+
+    func testDisplayValueUsesHexForUnknownBinaryPayload() {
+        var bytes = ByteBufferAllocator().buffer(capacity: 2)
+        bytes.writeInteger(UInt8(0xFF))
+        bytes.writeInteger(UInt8(0x00))
+
+        let cell = PostgresCell(
+            bytes: bytes,
+            dataType: .bytea,
+            format: .binary,
+            columnName: "payload",
+            columnIndex: 0
+        )
+
+        XCTAssertEqual(PostgresRepository.displayValue(cell), "0xff00")
+    }
+
+    func testDisplayValueDecodesBinaryJSONBArray() {
+        let element = #"{"key":"container_bottle_type","level":1,"value":"beverages"}"#
+        var bytes = ByteBufferAllocator().buffer(capacity: 256)
+        bytes.writeInteger(Int32(1), endianness: .big)
+        bytes.writeInteger(Int32(0), endianness: .big)
+        bytes.writeInteger(UInt32(PostgresDataType.jsonb.rawValue), endianness: .big)
+        bytes.writeInteger(Int32(1), endianness: .big)
+        bytes.writeInteger(Int32(1), endianness: .big)
+        bytes.writeInteger(Int32(1 + element.utf8.count), endianness: .big)
+        bytes.writeInteger(UInt8(1))
+        bytes.writeString(element)
+
+        let cell = PostgresCell(
+            bytes: bytes,
+            dataType: .jsonbArray,
+            format: .binary,
+            columnName: "specs_structure",
+            columnIndex: 0
+        )
+
+        let rendered = PostgresRepository.displayValue(cell)
+        XCTAssertTrue(rendered.contains("\"container_bottle_type\""))
+        XCTAssertTrue(rendered.contains("\"beverages\""))
+        XCTAssertTrue(rendered.hasPrefix("["))
+    }
+
+    func testSqlAssignmentExpressionConvertsJSONArrayToJSONBArrayExpression() throws {
+        let expression = try PostgresRepository.sqlAssignmentExpression(
+            for: #"[{"key":"size","level":1,"value":"small"}]"#,
+            typeName: "_jsonb"
+        )
+
+        XCTAssertTrue(expression.contains("jsonb_array_elements"))
+        XCTAssertTrue(expression.contains("array_agg(value::jsonb)"))
     }
 }

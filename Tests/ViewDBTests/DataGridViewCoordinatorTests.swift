@@ -81,6 +81,13 @@ final class DataGridViewCoordinatorTests: XCTestCase {
         XCTAssertEqual(huge, 540)
     }
 
+    func testNormalizeCellDisplayTextFlattensMultilineContent() {
+        let raw = "line1\r\nline2\tvalue\nline3"
+        let normalized = DataGridView.Coordinator.normalizeCellDisplayText(raw)
+
+        XCTAssertEqual(normalized, "line1 ↩ line2    value ↩ line3")
+    }
+
     func testResponsivePopoverPlacementPrefersBelowWhenThereIsMoreSpace() {
         let placement = DataGridView.Coordinator.responsivePopoverPlacement(
             preferredHeight: 320,
