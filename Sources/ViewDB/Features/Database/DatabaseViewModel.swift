@@ -54,6 +54,8 @@ final class DatabaseViewModel {
         }
     }
 
+    var rowSearch = ""
+
     var errorMessage: String?
     var sqlErrorMessage: String?
 
@@ -67,6 +69,7 @@ final class DatabaseViewModel {
     private var sqlTask: Task<Void, Never>?
     private var countTask: Task<Void, Never>?
     private var editMetadataTask: Task<Void, Never>?
+    private var searchTask: Task<Void, Never>?
     private let logger = Logger(label: "com.viewdb.ui.database")
     private let previewLimitChars = 256
 
@@ -117,6 +120,8 @@ final class DatabaseViewModel {
         guard selectedTable != table else { return }
         selectedTable = table
         activeSort = nil
+        rowSearch = ""
+        searchTask?.cancel()
         loadEditMetadata(for: table)
         fetchRows(
             request: RowPageRequest(
@@ -127,6 +132,25 @@ final class DatabaseViewModel {
             ),
             refreshCount: true
         )
+    }
+
+    func performSearch() {
+        searchTask?.cancel()
+        searchTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .milliseconds(300))
+            if Task.isCancelled { return }
+            self.fetchRows(
+                request: RowPageRequest(
+                    limit: self.rowsPerPage,
+                    direction: .initial,
+                    offset: 0,
+                    sort: self.activeSort,
+                    searchText: self.rowSearch.isEmpty ? nil : self.rowSearch
+                ),
+                refreshCount: true
+            )
+        }
     }
 
     func fetchNextPage() {
@@ -496,6 +520,7 @@ final class DatabaseViewModel {
     }
 
     private func fetchRowCount(table: TableRef) {
+        let searchText = rowSearch.isEmpty ? nil : rowSearch
         countTask?.cancel()
         isLoadingCount = true
         countTask = Task { [weak self] in
@@ -503,7 +528,7 @@ final class DatabaseViewModel {
             defer { self.isLoadingCount = false }
 
             do {
-                let count = try await self.queryService.fetchRowCount(database: self.database, table: table)
+                let count = try await self.queryService.fetchRowCount(database: self.database, table: table, searchText: searchText)
                 if Task.isCancelled { return }
                 guard self.selectedTable?.id == table.id else { return }
                 self.totalRowCount = max(0, count)

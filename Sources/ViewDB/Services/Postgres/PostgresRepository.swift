@@ -527,14 +527,27 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
         }
     }
 
-    func fetchRowCount(database: DatabaseRef, table: TableRef) async throws -> Int {
+    func fetchRowCount(database: DatabaseRef, table: TableRef, searchText: String?) async throws -> Int {
         let instance = try await resolveInstance(for: database)
         let safeSchema = Self.quoteIdentifier(table.schema)
         let safeTable = Self.quoteIdentifier(table.name)
+        let baseTable = "\(safeSchema).\(safeTable)"
+
+        let columns: [String]
+        if searchText != nil {
+            let pagingPlan = try await resolvePagingPlan(database: database, table: table, instance: instance)
+            columns = pagingPlan.columns
+        } else {
+            columns = []
+        }
 
         return try await sessionPool.withConnection(instance: instance, database: database.name) { connection, logger in
             let start = CFAbsoluteTimeGetCurrent()
-            let query = PostgresQuery(unsafeSQL: "SELECT COUNT(*) FROM \(safeSchema).\(safeTable)")
+            var sql = "SELECT COUNT(*) FROM \(baseTable)"
+            if let whereClause = Self.searchWhereClause(searchText: searchText, columns: columns) {
+                sql += " WHERE \(whereClause)"
+            }
+            let query = PostgresQuery(unsafeSQL: sql)
             let sequence = try await connection.query(query, logger: logger)
             let rows = try await sequence.collect()
             guard let row = rows.first,
@@ -797,6 +810,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
         let safeTable = quoteIdentifier(table.name)
         let baseTable = "\(safeSchema).\(safeTable)"
         let normalizedOffset = max(0, request.offset)
+        let whereClause = searchWhereClause(searchText: request.searchText, columns: pagingPlan.columns)
 
         if let explicitSortClause = explicitSortClause(sort: request.sort, pagingPlan: pagingPlan) {
             return QueryExecutionPlan(
@@ -804,7 +818,8 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
                     baseTable: baseTable,
                     limit: limit,
                     offset: normalizedOffset,
-                    orderByClause: explicitSortClause
+                    orderByClause: explicitSortClause,
+                    whereClause: whereClause
                 ),
                 hiddenLeadingCursor: false,
                 orderColumn: nil,
@@ -821,7 +836,8 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
                     baseTable: baseTable,
                     limit: limit,
                     offset: normalizedOffset,
-                    orderByClause: nil
+                    orderByClause: nil,
+                    whereClause: whereClause
                 ),
                 hiddenLeadingCursor: false,
                 orderColumn: nil,
@@ -834,7 +850,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
             guard let orderColumn = pagingPlan.orderColumn,
                   let orderType = pagingPlan.orderType else {
                 return QueryExecutionPlan(
-                    sql: offsetQuery(baseTable: baseTable, limit: limit, offset: normalizedOffset, orderByClause: nil),
+                    sql: offsetQuery(baseTable: baseTable, limit: limit, offset: normalizedOffset, orderByClause: nil, whereClause: whereClause),
                     hiddenLeadingCursor: false,
                     orderColumn: nil,
                     strategy: .offset,
@@ -848,7 +864,8 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
                 orderColumn: orderColumn,
                 orderType: orderType,
                 request: request,
-                limit: limit
+                limit: limit,
+                whereClause: whereClause
             )
             return QueryExecutionPlan(
                 sql: query,
@@ -860,7 +877,7 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
             )
 
         case .keysetCTID:
-            let query = ctidOrderedQuery(baseTable: baseTable, request: request, limit: limit)
+            let query = ctidOrderedQuery(baseTable: baseTable, request: request, limit: limit, whereClause: whereClause)
             return QueryExecutionPlan(
                 sql: query,
                 hiddenLeadingCursor: true,
@@ -877,7 +894,8 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
         orderColumn: String,
         orderType: KeysetValueType,
         request: RowPageRequest,
-        limit: Int
+        limit: Int,
+        whereClause: String? = nil
     ) -> String {
         let safeOrderColumn = quoteIdentifier(orderColumn)
 
@@ -886,25 +904,34 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
                 baseTable: baseTable,
                 limit: limit,
                 offset: request.offset,
-                orderByClause: " ORDER BY \(safeOrderColumn) ASC"
+                orderByClause: " ORDER BY \(safeOrderColumn) ASC",
+                whereClause: whereClause
             )
         }
 
         let orderDirection: String = request.direction == .previous ? "DESC" : "ASC"
         var sql = "SELECT * FROM \(baseTable)"
 
+        var conditions: [String] = []
         if request.direction != .initial,
            let cursor = request.cursor,
            let literal = sqlLiteral(for: cursor, type: orderType) {
             let comparator = request.direction == .previous ? "<" : ">"
-            sql += " WHERE \(safeOrderColumn) \(comparator) \(literal)"
+            conditions.append("\(safeOrderColumn) \(comparator) \(literal)")
         } else if request.direction != .initial {
             return offsetQuery(
                 baseTable: baseTable,
                 limit: limit,
                 offset: request.offset,
-                orderByClause: " ORDER BY \(safeOrderColumn) ASC"
+                orderByClause: " ORDER BY \(safeOrderColumn) ASC",
+                whereClause: whereClause
             )
+        }
+        if let whereClause {
+            conditions.append(whereClause)
+        }
+        if !conditions.isEmpty {
+            sql += " WHERE \(conditions.joined(separator: " AND "))"
         }
 
         sql += " ORDER BY \(safeOrderColumn) \(orderDirection) LIMIT \(limit + 1)"
@@ -914,35 +941,67 @@ actor PostgresRepository: CatalogService, QueryService, CredentialService, CellE
     private static func ctidOrderedQuery(
         baseTable: String,
         request: RowPageRequest,
-        limit: Int
+        limit: Int,
+        whereClause: String? = nil
     ) -> String {
+        let baseSelect = "SELECT ctid::text AS _viewdb_cursor, * FROM \(baseTable)"
+
         if request.direction == .initial && request.offset > 0 {
-            return "SELECT ctid::text AS _viewdb_cursor, * FROM \(baseTable) ORDER BY ctid ASC LIMIT \(limit + 1) OFFSET \(request.offset)"
+            var sql = baseSelect
+            if let whereClause { sql += " WHERE \(whereClause)" }
+            sql += " ORDER BY ctid ASC LIMIT \(limit + 1) OFFSET \(request.offset)"
+            return sql
         }
 
         let orderDirection: String = request.direction == .previous ? "DESC" : "ASC"
-        var sql = "SELECT ctid::text AS _viewdb_cursor, * FROM \(baseTable)"
+        var sql = baseSelect
 
+        var conditions: [String] = []
         if request.direction != .initial,
            let cursor = request.cursor,
            let literal = sqlLiteral(for: cursor, type: .ctid) {
             let comparator = request.direction == .previous ? "<" : ">"
-            sql += " WHERE ctid \(comparator) \(literal)"
+            conditions.append("ctid \(comparator) \(literal)")
         } else if request.direction != .initial {
-            return "SELECT ctid::text AS _viewdb_cursor, * FROM \(baseTable) ORDER BY ctid ASC LIMIT \(limit + 1) OFFSET \(request.offset)"
+            var fallback = baseSelect
+            if let whereClause { fallback += " WHERE \(whereClause)" }
+            fallback += " ORDER BY ctid ASC LIMIT \(limit + 1) OFFSET \(request.offset)"
+            return fallback
+        }
+        if let whereClause {
+            conditions.append(whereClause)
+        }
+        if !conditions.isEmpty {
+            sql += " WHERE \(conditions.joined(separator: " AND "))"
         }
 
         sql += " ORDER BY ctid \(orderDirection) LIMIT \(limit + 1)"
         return sql
     }
 
-    private static func offsetQuery(baseTable: String, limit: Int, offset: Int, orderByClause: String?) -> String {
+    private static func offsetQuery(baseTable: String, limit: Int, offset: Int, orderByClause: String?, whereClause: String? = nil) -> String {
         var sql = "SELECT * FROM \(baseTable)"
+        if let whereClause {
+            sql += " WHERE \(whereClause)"
+        }
         if let orderByClause {
             sql += orderByClause
         }
         sql += " LIMIT \(limit + 1) OFFSET \(max(0, offset))"
         return sql
+    }
+
+    private static func searchWhereClause(searchText: String?, columns: [String]) -> String? {
+        guard let text = searchText,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !columns.isEmpty else { return nil }
+        let escaped = text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+            .replacingOccurrences(of: "'", with: "''")
+        let conditions = columns.map { "\(quoteIdentifier($0))::text ILIKE '%\(escaped)%' ESCAPE '\\'" }
+        return "(\(conditions.joined(separator: " OR ")))"
     }
 
     private static func collectRows(

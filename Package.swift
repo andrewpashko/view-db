@@ -18,6 +18,14 @@ let package = Package(
             name: "ViewDB",
             dependencies: [
                 .product(name: "PostgresNIO", package: "postgres-nio"),
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/ViewDB/Info.plist",
+                ]),
             ]
         ),
         .testTarget(

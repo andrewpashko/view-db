@@ -6,6 +6,7 @@ struct DatabaseView: View {
 
     @State private var viewModel: DatabaseViewModel
     @FocusState private var isTableSearchFocused: Bool
+    @FocusState private var isRowSearchFocused: Bool
 
     init(database: DatabaseRef, environment: AppEnvironment) {
         self.database = database
@@ -29,6 +30,7 @@ struct DatabaseView: View {
         .simultaneousGesture(
             TapGesture().onEnded {
                 isTableSearchFocused = false
+                isRowSearchFocused = false
             }
         )
         .navigationTitle(database.name)
@@ -245,8 +247,13 @@ struct DatabaseView: View {
                 .accessibilityHidden(!viewModel.isLoadingRows)
 
                 Spacer(minLength: 0)
+
+                ExpandableSearchField(text: $viewModel.rowSearch, isFocused: $isRowSearchFocused)
+                    .onChange(of: viewModel.rowSearch) { _, _ in
+                        viewModel.performSearch()
+                    }
             }
-            .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
 
             if viewModel.rowPage.columns.isEmpty {
                 ContentUnavailableView(

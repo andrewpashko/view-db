@@ -9,6 +9,6 @@ protocol QueryService: Sendable {
         previewLimitChars: Int
     ) async throws -> RowPagePreview
     func fetchCellValue(database: DatabaseRef, table: TableRef, rowIdentity: RowIdentity, columnName: String) async throws -> String
-    func fetchRowCount(database: DatabaseRef, table: TableRef) async throws -> Int
+    func fetchRowCount(database: DatabaseRef, table: TableRef, searchText: String?) async throws -> Int
     func runReadOnlySQL(database: DatabaseRef, sql: String, limit: Int) async throws -> RowPage
 }

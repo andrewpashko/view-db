@@ -38,13 +38,15 @@ struct RowPageRequest: Sendable {
     let offset: Int
     let cursor: String?
     let sort: TableSort?
+    let searchText: String?
 
-    init(limit: Int, direction: RowPageDirection, offset: Int = 0, cursor: String? = nil, sort: TableSort? = nil) {
+    init(limit: Int, direction: RowPageDirection, offset: Int = 0, cursor: String? = nil, sort: TableSort? = nil, searchText: String? = nil) {
         self.limit = limit
         self.direction = direction
         self.offset = max(0, offset)
         self.cursor = cursor
         self.sort = sort
+        self.searchText = searchText
     }
 }
 

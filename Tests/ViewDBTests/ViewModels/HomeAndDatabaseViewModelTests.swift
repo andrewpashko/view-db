@@ -167,7 +167,7 @@ private actor MockQueryService: QueryService, CellEditingService {
         return updatedValueOverride ?? value ?? "NULL"
     }
 
-    func fetchRowCount(database: DatabaseRef, table: TableRef) async throws -> Int {
+    func fetchRowCount(database: DatabaseRef, table: TableRef, searchText: String?) async throws -> Int {
         if rowCountDelayMS > 0 {
             try? await Task.sleep(for: .milliseconds(Int(rowCountDelayMS)))
         }
